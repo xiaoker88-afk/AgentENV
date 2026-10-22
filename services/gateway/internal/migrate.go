@@ -45,6 +45,34 @@ const migrateTimeout = 5 * time.Minute
 // perStepTimeout bounds each individual upstream HTTP call.
 const perStepTimeout = 30 * time.Second
 
+const migrationStageMarker = "AENV_MIGRATION_STAGE"
+
+type migrationStageEvent struct {
+	Schema          string `json:"schema"`
+	TimestampUnixMS int64  `json:"timestamp_unix_ms"`
+	Component       string `json:"component"`
+	MigrationID     string `json:"migration_id"`
+	Stage           string `json:"stage"`
+	DurationMS      int64  `json:"duration_ms"`
+	Status          string `json:"status"`
+	SandboxID       string `json:"sandbox_id,omitempty"`
+	SnapshotID      string `json:"snapshot_id,omitempty"`
+	SourceNode      string `json:"source_node,omitempty"`
+	TargetNode      string `json:"target_node,omitempty"`
+}
+
+func (s *Server) logMigrationStage(event migrationStageEvent) {
+	event.Schema = "agentenv.migration-stage.v1"
+	event.TimestampUnixMS = time.Now().UnixMilli()
+	event.Component = "gateway"
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		s.logger.Warn("failed to serialize migration timing event", zap.Error(err))
+		return
+	}
+	s.logger.Info(migrationStageMarker + " " + string(encoded))
+}
+
 // handleMigrate implements POST /sandboxes/{sandboxID}/migrate.
 //
 // Migration orchestration:
@@ -70,6 +98,7 @@ const perStepTimeout = 30 * time.Second
 // The handler returns success only when the target-side create completed
 // with the requested sandbox ID.
 func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
+	totalStarted := time.Now()
 	sandboxID, ok := sandboxIDFromPath(r.URL.Path)
 	if !ok {
 		http.Error(w, "sandbox id required", http.StatusBadRequest)
@@ -85,6 +114,18 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "targetNodeID is required", http.StatusBadRequest)
 		return
 	}
+	migrationID := fmt.Sprintf("%s-%d", sandboxID, totalStarted.UnixNano())
+	totalStatus := "error"
+	defer func() {
+		s.logMigrationStage(migrationStageEvent{
+			MigrationID: migrationID,
+			Stage:       "migration_total",
+			DurationMS:  time.Since(totalStarted).Milliseconds(),
+			Status:      totalStatus,
+			SandboxID:   sandboxID,
+			TargetNode:  strings.TrimSpace(req.TargetNodeID),
+		})
+	}()
 
 	migrateCtx, cancel := context.WithTimeout(r.Context(), migrateTimeout)
 	defer cancel()
@@ -93,6 +134,11 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	srcRPCTime := time.Now()
 	srcResp, err := s.queryOnlyScheduler.LookupNode(migrateCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
 	recordGatewaySchedulerRPC("LookupNode", srcRPCTime, err)
+	s.logMigrationStage(migrationStageEvent{
+		MigrationID: migrationID, Stage: "source_lookup",
+		DurationMS: time.Since(srcRPCTime).Milliseconds(), Status: migrationResultStatus(err),
+		SandboxID: sandboxID,
+	})
 	if err != nil {
 		s.writeSchedulerError(w, err)
 		return
@@ -118,6 +164,11 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		tgtRPCTime := time.Now()
 		tgtResp, err := s.scheduler.GetNode(migrateCtx, &schedulerv1.GetNodeRequest{NodeId: req.TargetNodeID})
 		recordGatewaySchedulerRPC("GetNode", tgtRPCTime, err)
+		s.logMigrationStage(migrationStageEvent{
+			MigrationID: migrationID, Stage: "target_lookup",
+			DurationMS: time.Since(tgtRPCTime).Milliseconds(), Status: migrationResultStatus(err),
+			SandboxID: sandboxID, SourceNode: sourceNode.GetNodeId(), TargetNode: req.TargetNodeID,
+		})
 		if err != nil {
 			s.writeSchedulerError(w, err)
 			return
@@ -155,12 +206,19 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		EndAt time.Time `json:"endAt"`
 		State string    `json:"state"`
 	}
-	if err := s.migrateCall(migrateCtx, sourceNode.GetEndpoint(), http.MethodGet,
-		"/sandboxes/"+sandboxID, nil, &srcInfo); err != nil {
+	metadataStarted := time.Now()
+	metadataErr := s.migrateCall(migrateCtx, sourceNode.GetEndpoint(), http.MethodGet,
+		"/sandboxes/"+sandboxID, nil, &srcInfo)
+	s.logMigrationStage(migrationStageEvent{
+		MigrationID: migrationID, Stage: "source_metadata",
+		DurationMS: time.Since(metadataStarted).Milliseconds(), Status: migrationResultStatus(metadataErr),
+		SandboxID: sandboxID, SourceNode: sourceNode.GetNodeId(), TargetNode: targetNode.GetNodeId(),
+	})
+	if metadataErr != nil {
 		s.logger.Warn("migrate: fetch source sandbox metadata failed; using default timeout and running target",
 			zap.String("sandbox_id", sandboxID),
 			zap.String("source_node", sourceNode.GetNodeId()),
-			zap.Error(err),
+			zap.Error(metadataErr),
 		)
 	}
 	remainingSecs := 300
@@ -182,14 +240,22 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	var snapshot struct {
 		SnapshotID string `json:"snapshotID"`
 	}
-	if err := s.migrateCall(migrateCtx, sourceNode.GetEndpoint(), http.MethodPost,
-		"/sandboxes/"+sandboxID+"/snapshots", nil, &snapshot); err != nil {
+	snapshotStarted := time.Now()
+	snapshotErr := s.migrateCall(migrateCtx, sourceNode.GetEndpoint(), http.MethodPost,
+		"/sandboxes/"+sandboxID+"/snapshots", nil, &snapshot)
+	s.logMigrationStage(migrationStageEvent{
+		MigrationID: migrationID, Stage: "source_snapshot",
+		DurationMS: time.Since(snapshotStarted).Milliseconds(), Status: migrationResultStatus(snapshotErr),
+		SandboxID: sandboxID, SnapshotID: snapshot.SnapshotID,
+		SourceNode: sourceNode.GetNodeId(), TargetNode: targetNode.GetNodeId(),
+	})
+	if snapshotErr != nil {
 		s.logger.Warn("migrate: snapshot on source failed",
 			zap.String("sandbox_id", sandboxID),
 			zap.String("source_node", sourceNode.GetNodeId()),
-			zap.Error(err),
+			zap.Error(snapshotErr),
 		)
-		http.Error(w, "migrate: snapshot source failed: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "migrate: snapshot source failed: "+snapshotErr.Error(), http.StatusBadGateway)
 		return
 	}
 	if strings.TrimSpace(snapshot.SnapshotID) == "" {
@@ -205,14 +271,22 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	//    create-then-delete order: its paused record on the source node is
 	//    itself the fallback, so it must not be deleted up front.
 	if !sourcePaused {
-		if err := s.migrateCall(migrateCtx, sourceNode.GetEndpoint(), http.MethodDelete,
-			"/sandboxes/"+sandboxID, nil, nil); err != nil {
+		deleteStarted := time.Now()
+		deleteErr := s.migrateCall(migrateCtx, sourceNode.GetEndpoint(), http.MethodDelete,
+			"/sandboxes/"+sandboxID, nil, nil)
+		s.logMigrationStage(migrationStageEvent{
+			MigrationID: migrationID, Stage: "source_delete",
+			DurationMS: time.Since(deleteStarted).Milliseconds(), Status: migrationResultStatus(deleteErr),
+			SandboxID: sandboxID, SnapshotID: snapshot.SnapshotID,
+			SourceNode: sourceNode.GetNodeId(), TargetNode: targetNode.GetNodeId(),
+		})
+		if deleteErr != nil {
 			s.logger.Warn("migrate: kill on source failed; aborting before target create",
 				zap.String("sandbox_id", sandboxID),
 				zap.String("source_node", sourceNode.GetNodeId()),
-				zap.Error(err),
+				zap.Error(deleteErr),
 			)
-			http.Error(w, "migrate: kill source failed: "+err.Error(), http.StatusBadGateway)
+			http.Error(w, "migrate: kill source failed: "+deleteErr.Error(), http.StatusBadGateway)
 			return
 		}
 		s.logger.Info("migrate: source sandbox killed",
@@ -232,16 +306,23 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	//    runtime to launch the target directly into the Paused state so the
 	//    sandbox's run state is preserved across the migration.
 	createBody, _ := json.Marshal(map[string]interface{}{
-		"templateID":   snapshot.SnapshotID,
-		"sandboxID":    sandboxID,
-		"timeout":      remainingSecs,
-		"startPaused":  sourcePaused,
+		"templateID":  snapshot.SnapshotID,
+		"sandboxID":   sandboxID,
+		"timeout":     remainingSecs,
+		"startPaused": sourcePaused,
 	})
 	var created struct {
 		SandboxID string `json:"sandboxID"`
 	}
+	targetCreateStarted := time.Now()
 	createErr := s.migrateCall(migrateCtx, targetNode.GetEndpoint(), http.MethodPost,
 		"/sandboxes", bytes.NewReader(createBody), &created)
+	s.logMigrationStage(migrationStageEvent{
+		MigrationID: migrationID, Stage: "target_restore",
+		DurationMS: time.Since(targetCreateStarted).Milliseconds(), Status: migrationResultStatus(createErr),
+		SandboxID: sandboxID, SnapshotID: snapshot.SnapshotID,
+		SourceNode: sourceNode.GetNodeId(), TargetNode: targetNode.GetNodeId(),
+	})
 	newSandboxID := ""
 	if createErr == nil {
 		newSandboxID = strings.TrimSpace(created.SandboxID)
@@ -348,8 +429,15 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	//    sources: a running source was already killed before the create.
 	var delErr error
 	if sourcePaused {
+		deleteStarted := time.Now()
 		delErr = s.migrateCall(migrateCtx, sourceNode.GetEndpoint(), http.MethodDelete,
 			"/sandboxes/"+sandboxID, nil, nil)
+		s.logMigrationStage(migrationStageEvent{
+			MigrationID: migrationID, Stage: "source_delete",
+			DurationMS: time.Since(deleteStarted).Milliseconds(), Status: migrationResultStatus(delErr),
+			SandboxID: sandboxID, SnapshotID: snapshot.SnapshotID,
+			SourceNode: sourceNode.GetNodeId(), TargetNode: targetNode.GetNodeId(),
+		})
 		if delErr != nil {
 			s.logger.Warn("migrate: delete on source failed (best-effort)",
 				zap.String("sandbox_id", sandboxID),
@@ -368,6 +456,12 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		Node:      targetNode,
 	})
 	recordGatewaySchedulerRPC("RecordAssignment", recRPCTime, recErr)
+	s.logMigrationStage(migrationStageEvent{
+		MigrationID: migrationID, Stage: "assignment_update",
+		DurationMS: time.Since(recRPCTime).Milliseconds(), Status: migrationResultStatus(recErr),
+		SandboxID: sandboxID, SnapshotID: snapshot.SnapshotID,
+		SourceNode: sourceNode.GetNodeId(), TargetNode: targetNode.GetNodeId(),
+	})
 	if recErr != nil {
 		// Sandbox exists on target but routing still points to source.
 		// Surface the warning to the caller as a non-2xx is misleading; the
@@ -389,11 +483,19 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		zap.NamedError("record_assignment_err", recErr),
 	)
 
+	totalStatus = "ok"
 	s.writeJSON(w, http.StatusOK, migrateResponse{
 		SandboxID:  newSandboxID,
 		NodeID:     targetNode.GetNodeId(),
 		SnapshotID: snapshot.SnapshotID,
 	})
+}
+
+func migrationResultStatus(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	return "error"
 }
 
 // migrateCall performs a single HTTP call to a backend node during migration.
