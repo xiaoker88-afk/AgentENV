@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio::sync::Mutex as AsyncMutex;
+
 use super::context::UrmaContext;
 use super::ops::{JettyHandle, JettyId, TargetJettyHandle};
 use crate::p2p::error::{Error as P2pError, Result as P2pResult};
@@ -51,6 +53,10 @@ pub struct PeerConnectionManager {
     context: Arc<UrmaContext>,
     /// Remote EID hex -> connection.
     connections: Mutex<HashMap<String, PeerConnection>>,
+    /// Serialize imports for one remote EID. Snapshot restore may fetch
+    /// several artifacts concurrently, but bonding cannot import the same
+    /// remote vjetty concurrently.
+    import_gates: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     idle_ttl: Duration,
     connect_timeout: Duration,
 }
@@ -60,6 +66,7 @@ impl PeerConnectionManager {
         Self {
             context,
             connections: Mutex::new(HashMap::new()),
+            import_gates: Mutex::new(HashMap::new()),
             idle_ttl,
             connect_timeout,
         }
@@ -118,17 +125,32 @@ impl PeerConnectionManager {
                 return Ok(conn.clone());
             }
         }
+        let gate = {
+            let mut gates = self.import_gates.lock().unwrap();
+            gates
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        let gate_guard = gate.lock_owned().await;
+        {
+            let connections = self.connections.lock().unwrap();
+            if let Some(conn) = connections.get(&key) {
+                conn.touch();
+                return Ok(conn.clone());
+            }
+        }
         let remote = *remote;
         let blocking_self = Arc::clone(self);
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::task::spawn_blocking(move || {
             let result = blocking_self.import_sync(&remote);
-            if let Err(Ok(conn)) = tx.send(result) {
+            if let Err((_guard, Ok(conn))) = tx.send((gate_guard, result)) {
                 blocking_self.close_connection(conn);
             }
         });
-        let conn = match tokio::time::timeout(self.connect_timeout, rx).await {
-            Ok(Ok(result)) => result?,
+        let (gate_guard, result) = match tokio::time::timeout(self.connect_timeout, rx).await {
+            Ok(Ok(received)) => received,
             Ok(Err(err)) => {
                 return Err(P2pError::internal_message("urma connect task join", err));
             }
@@ -139,6 +161,7 @@ impl PeerConnectionManager {
                 )));
             }
         };
+        let conn = result?;
         let existing = {
             let mut connections = self.connections.lock().unwrap();
             match connections.get(&key) {
@@ -152,8 +175,10 @@ impl PeerConnectionManager {
         if let Some(existing) = existing {
             existing.touch();
             self.close_connection(conn);
+            drop(gate_guard);
             Ok(existing)
         } else {
+            drop(gate_guard);
             Ok(conn)
         }
     }
@@ -228,6 +253,29 @@ mod tests {
         let status = ops.status.lock().unwrap();
         assert_eq!(status.jetties_imported.len(), 1);
         assert_ne!(conn.jetty.0, 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_share_one_import() {
+        let ops = MockUrmaOps::new();
+        ops.status.lock().unwrap().import_delay = Duration::from_millis(40);
+        let context = Arc::new(UrmaContext::mock(ops.clone()).unwrap());
+        let manager = Arc::new(PeerConnectionManager::new(
+            context,
+            Duration::from_secs(1),
+            Duration::from_secs(3600),
+        ));
+
+        let remote = remote_id();
+        let (a, b, c) = tokio::join!(
+            manager.ensure_connection(&remote),
+            manager.ensure_connection(&remote),
+            manager.ensure_connection(&remote),
+        );
+        let a = a.unwrap();
+        assert_eq!(a.jetty, b.unwrap().jetty);
+        assert_eq!(a.jetty, c.unwrap().jetty);
+        assert_eq!(ops.status.lock().unwrap().jetties_imported.len(), 1);
     }
 
     #[tokio::test]
