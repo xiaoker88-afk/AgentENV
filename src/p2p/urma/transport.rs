@@ -1,12 +1,12 @@
 //! URMA P2P transport backend implementing [`P2pTransport`].
 //!
-//! M1 scope (RTP transport plane, dynamic connections):
+//! RM/CTP transport over a bonding UB device:
 //!
 //! - `publish`: artifact bytes are held in memory and registered as a URMA
 //!   segment; the advertised locator encodes (EID, serve jetty, UBVA, key,
 //!   length).
-//! - `fetch*`: resolve the backend locator, dynamically bind to the remote
-//!   serve jetty (RTP) and pull the byte range with one-sided READs (RM)
+//! - `fetch*`: resolve the backend locator, import the remote CTP serve
+//!   jetty and pull the byte range with one-sided READs (RM)
 //!   through a registered local bounce buffer.
 //! - `lookup`: local publications only. Remote catalog queries over URMA
 //!   SEND/RECV are a follow-up (M2); until then descriptors must reach
@@ -354,7 +354,7 @@ impl UrmaP2pTransport {
         });
         let catalog_server = CatalogServer::spawn(context.clone(), serve_jetty, resolve);
 
-        // Catalog client: SEND/RECV over the shared RTP connections.
+        // Catalog client: SEND/RECV over imported CTP jetties.
         let catalog = Arc::new(UrmaCatalog::new(
             context.clone(),
             connections.clone(),
@@ -520,7 +520,14 @@ impl UrmaP2pTransport {
                 let chunk_len = remaining.min(window);
                 let read_start = Instant::now();
                 if let Err(err) = reader
-                    .read_range(&locator, pos, chunk_len, registered.tseg, registered.ubva, fetch_timeout)
+                    .read_range(
+                        &locator,
+                        pos,
+                        chunk_len,
+                        registered.tseg,
+                        registered.local_va,
+                        fetch_timeout,
+                    )
                     .await
                 {
                     status = "error";
@@ -661,8 +668,8 @@ impl UrmaP2pTransport {
             // Retry up to 3 times with 300ms intervals to cover the URMA SEND
             // cold-start window (~1s) where the first SEND after import_jetty
             // is silently dropped by the UB hardware.  The hardware-level
-            // rnr_retry (7) does not help here because bind_jetty itself
-            // succeeds — only the subsequent SEND is dropped.
+            // rnr_retry (7) does not help here because only the subsequent
+            // SEND is dropped.
             let mut last_err = None;
             for attempt in 0..3u32 {
                 match self.catalog.query(peer, key).await {
@@ -949,7 +956,7 @@ mod tests {
         let status = ops.status.lock().unwrap();
         // One jetty import, one segment import, one READ (10_000 bytes is a
         // single 4MiB chunk by default).
-        assert_eq!(status.bound.len(), 1);
+        assert_eq!(status.jetties_imported.len(), 1);
         assert_eq!(status.segs_imported.len(), 1);
         assert_eq!(status.reads_log.len(), 1);
         assert_eq!(status.reads_log[0].len, 10_000);

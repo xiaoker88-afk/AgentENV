@@ -126,6 +126,17 @@ impl UrmaContext {
         Ok((jetty, id))
     }
 
+    /// Create a short-lived RM connection jetty owned by the caller.
+    ///
+    /// Unlike [`Self::create_jetty`], this does not add the handle to the
+    /// context-wide shutdown list: `PeerConnectionManager` deletes it when
+    /// the imported peer connection is invalidated or expires.
+    pub(crate) fn create_connection_jetty(&self) -> P2pResult<JettyHandle> {
+        self.ops
+            .create_jetty(self.ctx, self.jfc)
+            .map_err(|e| P2pError::internal_message("urma create connection jetty", e))
+    }
+
     /// Allocate a fresh work request id for correlating completions.
     pub fn alloc_wr_id(&self) -> u64 {
         self.driver.next_wr_id.fetch_add(1, Ordering::Relaxed)
@@ -151,7 +162,6 @@ impl UrmaContext {
         }
         let jetties: Vec<JettyHandle> = self.jetties.lock().unwrap().drain(..).collect();
         for jetty in jetties {
-            let _ = self.ops.unbind_jetty(jetty);
             let _ = self.ops.delete_jetty(jetty);
         }
         let _ = self.ops.delete_jfc(self.jfc);

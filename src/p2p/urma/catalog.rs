@@ -2,7 +2,7 @@
 //!
 //! `lookup` needs a way to discover artifacts published on peer nodes
 //! without going through the scheduler. Each URMA transport runs a small
-//! catalog server on its serve jetty: peers establish an RTP connection
+//! catalog server on its serve jetty: peers import its CTP jetty
 //! (single transport plane for both SEND/RECV and one-sided READ/WRITE on
 //! UB hardware) to the serve jetty, then exchange a single request/response
 //! message pair.
@@ -149,7 +149,7 @@ pub trait RemoteCatalog: Send + Sync {
     ) -> Result<Option<P2pArtifactDescriptor>>;
 }
 
-/// Real catalog client: SEND/RECV over an RTP connection to the peer's serve
+/// Real catalog client: SEND/RECV over an imported CTP jetty to the peer's serve
 /// jetty. Control buffers are pooled (registered once, reused per query).
 pub struct UrmaCatalog {
     context: Arc<UrmaContext>,

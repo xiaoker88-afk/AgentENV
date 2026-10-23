@@ -9,8 +9,7 @@
 //!
 //! - UB devices run in `URMA_TM_RM` (reliable message, connectionless):
 //!   every WR carries the imported remote jetty (`tjetty`); there is no
-//!   RC-style bind handshake. [`UrmaOps::bind_jetty`] is kept as a hook so
-//!   connection management code stays transport-agnostic.
+//!   RC-style bind handshake.
 //! - A jetty on UB must be created with the `share_jfr` flag and an
 //!   explicitly created JFR attached; the real ops create one JFR per
 //!   jetty and remember it for teardown.
@@ -23,6 +22,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Length in bytes of an EID (Unified Bus endpoint identifier). Mirrors
 /// `URMA_EID_SIZE` in ffi.rs; duplicated so mock-based tests compile without
@@ -216,13 +216,6 @@ pub trait UrmaOps: Send + Sync {
     fn import_jetty(&self, ctx: CtxHandle, remote: &JettyId) -> OpsResult<TargetJettyHandle>;
 
     fn unimport_jetty(&self, tjetty: TargetJettyHandle) -> OpsResult<()>;
-
-    /// Establish the transport channel between a local jetty and an
-    /// imported remote jetty. UB RM is connectionless, so the real
-    /// implementation is a no-op; the hook exists for RC-style transports.
-    fn bind_jetty(&self, jetty: JettyHandle, tjetty: TargetJettyHandle) -> OpsResult<()>;
-
-    fn unbind_jetty(&self, jetty: JettyHandle) -> OpsResult<()>;
 
     /// Register local memory `[addr, addr+len)` as a segment and return the
     /// info remote peers need for one-sided access.
@@ -501,10 +494,16 @@ impl UrmaOps for RealUrmaOps {
 
             let mut jfs_cfg = ffi::urma_jfs_cfg_t {
                 depth: 64,
-                flag: 0,
+                // bonding_dev RM is supported only as CTP multi-path. This
+                // must match the create-side configuration used by
+                // `urma_perftest --ctp`; import-side `tp_type` alone is not
+                // enough for the bonding provider to import the vjetty.
+                flag: ffi::JFS_FLAG_MULTI_PATH,
                 trans_mode: ffi::URMA_TM_RM,
-                priority: 0, // RTP plane (priority 0-5) supports one-sided READ/WRITE and SEND/RECV on UB
-                max_sge: 1,
+                priority: 0,
+                // The bonding provider consumes one additional SGE. Mirror
+                // urma_perftest's `use_bonding` resource configuration.
+                max_sge: 2,
                 max_rsge: 1,
                 max_inline_data: 0,
                 rnr_retry: 7,
@@ -593,17 +592,6 @@ impl UrmaOps for RealUrmaOps {
         unsafe { Self::check("urma_unimport_jetty", ffi::urma_unimport_jetty(tjetty.as_ptr())) }
     }
 
-    fn bind_jetty(&self, _jetty: JettyHandle, _tjetty: TargetJettyHandle) -> OpsResult<()> {
-        // UB RM is connectionless: posting WRs against the imported remote
-        // jetty works without a channel setup. urma_bind_jetty is
-        // RC-only and returns an error on UB.
-        Ok(())
-    }
-
-    fn unbind_jetty(&self, _jetty: JettyHandle) -> OpsResult<()> {
-        Ok(())
-    }
-
     fn register_seg(&self, ctx: CtxHandle, addr: usize, len: u64) -> OpsResult<RegisteredSeg> {
         self.register_seg_with_access(ctx, addr, len, false)
     }
@@ -688,7 +676,7 @@ impl UrmaOps for RealUrmaOps {
     }
 
     fn post_send(&self, jetty: JettyHandle, wr: &MsgWr) -> OpsResult<()> {
-        // CTP/RTP SEND on UB hardware is limited to 4KiB per message
+        // CTP SEND on UB hardware is limited to 4KiB per message
         // (matches the catalog protocol's CATALOG_BUF_SIZE). Reject
         // oversized sends in software to surface the error at the
         // boundary instead of as a hardware completion failure.
@@ -798,9 +786,8 @@ pub struct MockUrmaOps {
 #[derive(Default)]
 pub struct MockStatus {
     pub devices: Vec<String>,
-    /// Simulated failures for `bind_jetty`; each attempt consumes one entry.
-    /// `Err(status)` fails, `Ok(())` succeeds. Missing entries succeed.
-    pub bind_failures: Vec<i32>,
+    /// Artificial blocking delay in `import_jetty`.
+    pub import_delay: Duration,
     /// Simulated failure status for `post_read`; 0 = success.
     pub read_failure: i32,
     /// Simulated failure status for `post_send`; 0 = success.
@@ -814,8 +801,6 @@ pub struct MockStatus {
     /// Remote jetty ids passed to `import_jetty`.
     pub jetties_imported: Vec<JettyId>,
     pub jetties_unimported: Vec<TargetJettyHandle>,
-    pub bound: Vec<(JettyHandle, TargetJettyHandle)>,
-    pub unbound: Vec<JettyHandle>,
     pub registered: Vec<(usize, u64)>,
     pub unregistered: usize,
     /// Remote segments passed to `import_seg`.
@@ -840,8 +825,6 @@ pub struct MockStatus {
     pub seg_windows: HashMap<TargetSegHandle, (usize, u64, u64)>,
     /// Imported target jetty -> the mock jetty handle it addresses.
     pub import_targets: HashMap<TargetJettyHandle, JettyHandle>,
-    /// Mock routing edges between bound jettys (local <-> remote).
-    pub jetty_binds: HashMap<JettyHandle, JettyHandle>,
 }
 
 #[cfg(test)]
@@ -937,6 +920,10 @@ impl UrmaOps for MockUrmaOps {
     }
 
     fn import_jetty(&self, _ctx: CtxHandle, remote: &JettyId) -> OpsResult<TargetJettyHandle> {
+        let delay = self.status.lock().unwrap().import_delay;
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
         let tjetty = TargetJettyHandle(self.alloc_handle());
         let mut status = self.status.lock().unwrap();
         status.jetties_imported.push(*remote);
@@ -950,29 +937,6 @@ impl UrmaOps for MockUrmaOps {
 
     fn unimport_jetty(&self, tjetty: TargetJettyHandle) -> OpsResult<()> {
         self.status.lock().unwrap().jetties_unimported.push(tjetty);
-        Ok(())
-    }
-
-    fn bind_jetty(&self, jetty: JettyHandle, tjetty: TargetJettyHandle) -> OpsResult<()> {
-        let mut status = self.status.lock().unwrap();
-        if let Some(err) = status.bind_failures.first().copied() {
-            status.bind_failures.remove(0);
-            if err != 0 {
-                return Err(UrmaOpError { operation: "urma_bind_jetty", status: err });
-            }
-        }
-        status.bound.push((jetty, tjetty));
-        // Record the mock routing edge: local jetty <-> remote jetty behind
-        // the imported target, so SENDs can be delivered to peer RECVs.
-        if let Some(remote) = status.import_targets.get(&tjetty).copied() {
-            status.jetty_binds.insert(jetty, remote);
-            status.jetty_binds.insert(remote, jetty);
-        }
-        Ok(())
-    }
-
-    fn unbind_jetty(&self, jetty: JettyHandle) -> OpsResult<()> {
-        self.status.lock().unwrap().unbound.push(jetty);
         Ok(())
     }
 
@@ -1041,9 +1005,14 @@ impl UrmaOps for MockUrmaOps {
             uasid: 0x1000,
             id: jetty.0 as u32,
         };
-        // Deliver to the oldest pending RECV on the destination jetty:
-        // the bound peer if known, else the sending jetty (loopback).
-        let dst = status.jetty_binds.get(&jetty).copied().unwrap_or(jetty);
+        // RM is connectionless: the target jetty carried by the work request
+        // selects the destination, without an RC bind. Fall back to the
+        // posting jetty only for local loopback tests.
+        let dst = status
+            .import_targets
+            .get(&wr.tjetty)
+            .copied()
+            .unwrap_or(jetty);
         if let Some(pos) = status.recvs.iter().position(|(j, _)| *j == dst) {
             let (_, recv_wr) = status.recvs.remove(pos);
             deliver_mock_message(&mut status, sender, wr, &recv_wr);

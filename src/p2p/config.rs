@@ -43,7 +43,7 @@ pub(crate) struct UrmaSettings {
     pub max_segments: usize,
     /// Bounce-window size used by the one-sided READ data path.
     pub read_chunk_bytes: u64,
-    /// Timeout applied to dynamic jetty bind (connection establishment) attempts.
+    /// Timeout applied to dynamic remote jetty import attempts.
     pub connect_timeout: Duration,
     /// How long an idle peer connection is kept before it is torn down.
     pub idle_connection_ttl: Duration,

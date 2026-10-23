@@ -81,8 +81,28 @@ pub const IMPORT_SEG_FLAG_MAPPED: u32 = 1 << 7;
 /// so complete_enable is bit 5. Required for the WR to produce a JFC entry.
 pub const JFS_WR_FLAG_COMPLETE_ENABLE: u32 = 1 << 5;
 
+/// `urma_jfs_flag_t` bit layout (UMDK 25.12):
+/// lock_free:1 | error_suspend:1 | outorder_comp:1 | order_type:8 |
+/// **multi_path:1** | ctp_rc_mul_path_mode:1 | reserved:19.
+///
+/// A bonding-device RM jetty is valid only in multi-path mode.  This is the
+/// create-side half of selecting CTP; setting `urma_rjetty_t.tp_type` only on
+/// import is not sufficient.
+pub const JFS_FLAG_MULTI_PATH: u32 = 1 << 11;
+
 /// `urma_jetty_flag_t`: share_jfr is bit 0 (mandatory for UB).
 pub const JETTY_FLAG_SHARE_JFR: u32 = 1;
+
+#[cfg(test)]
+mod flag_tests {
+    use super::*;
+
+    #[test]
+    fn bonding_ctp_multi_path_uses_umdk_bit_11() {
+        assert_eq!(JFS_FLAG_MULTI_PATH, 0x800);
+        assert_eq!(JFS_FLAG_MULTI_PATH & JETTY_FLAG_SHARE_JFR, 0);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Core value types
@@ -447,7 +467,7 @@ extern "C" {
     ) -> urma_status_t;
     pub fn urma_put_rjetty(rjetty: *mut urma_rjetty_t);
 
-    // Remote jetty import (RTP / RM).
+    // Remote jetty import (CTP / RM).
     pub fn urma_import_jetty(
         ctx: *mut urma_context_t,
         rjetty: *mut urma_rjetty_t,

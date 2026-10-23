@@ -39,7 +39,7 @@ impl RmReader {
 
     /// Pull `[offset, offset+len)` of the remote artifact described by
     /// `locator` into the local registered segment `local_tseg` whose base
-    /// UBVA is `local_base_va` (the read lands at `local_base_va`).
+    /// local virtual address is `local_base_va` (the read lands there).
     ///
     /// The local buffer must cover `len` bytes starting at its base.
     pub async fn read_range(
@@ -215,12 +215,20 @@ mod tests {
         let remote = locator("22222222222222222222222222222222", 7, 8192);
         let local = RegisteredSeg {
             tseg: TargetSegHandle(1234),
-            va: 0x9000,
+            local_va: 0x9000,
+            ubva: 0,
             key: 1,
         };
         // 6000 bytes with 4096-byte chunks => 2 reads (4096 + 1904).
         reader
-            .read_range(&remote, 500, 6000, local.tseg, local.va, Duration::from_secs(5))
+            .read_range(
+                &remote,
+                500,
+                6000,
+                local.tseg,
+                local.local_va,
+                Duration::from_secs(5),
+            )
             .await
             .unwrap();
 
@@ -228,10 +236,10 @@ mod tests {
         assert_eq!(status.reads_log.len(), 2);
         assert_eq!(status.reads_log[0].remote_va, remote.va + 500);
         assert_eq!(status.reads_log[0].len, 4096);
-        assert_eq!(status.reads_log[0].local_va, local.va);
+        assert_eq!(status.reads_log[0].local_va, local.local_va);
         assert_eq!(status.reads_log[1].remote_va, remote.va + 4596);
         assert_eq!(status.reads_log[1].len, 1904);
-        assert_eq!(status.reads_log[1].local_va, local.va + 4096);
+        assert_eq!(status.reads_log[1].local_va, local.local_va + 4096);
     }
 
     #[tokio::test]

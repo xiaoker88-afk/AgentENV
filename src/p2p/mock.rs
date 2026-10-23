@@ -255,7 +255,12 @@ impl P2pTransport for FakeP2pTransport {
         }
     }
 
-    async fn fetch(&self, descriptor: &P2pArtifactDescriptor, _destination: &Path) -> Result<u64> {
+    async fn fetch_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        _destination: &Path,
+        _options: P2pFetchOptions,
+    ) -> Result<u64> {
         self.fail()?;
         let artifacts = self.inner.artifacts.lock().unwrap();
         match artifacts.get(&descriptor.key) {
@@ -264,7 +269,11 @@ impl P2pTransport for FakeP2pTransport {
         }
     }
 
-    async fn fetch_bytes(&self, descriptor: &P2pArtifactDescriptor) -> Result<Bytes> {
+    async fn fetch_bytes_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        _options: P2pFetchOptions,
+    ) -> Result<Bytes> {
         self.fail()?;
         let artifacts = self.inner.artifacts.lock().unwrap();
         match artifacts.get(&descriptor.key) {
