@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/image/content.proto");
     println!("cargo:rerun-if-changed=src/image/build_history.proto");
     emit_git_rerun_inputs();
+    build_urma_shim();
 
     tonic_prost_build::configure()
         .build_server(false)
@@ -26,6 +27,46 @@ fn main() {
 
     let commit = resolve_git_commit().unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=AENV_GIT_COMMIT={commit}");
+}
+
+fn build_urma_shim() {
+    if std::env::var_os("CARGO_FEATURE_P2P_URMA").is_none() {
+        return;
+    }
+
+    println!("cargo:rerun-if-env-changed=UMDK_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=UMDK_LIB_DIR");
+    println!("cargo:rerun-if-changed=src/p2p/urma/native/shim.c");
+    println!("cargo:rerun-if-changed=src/p2p/urma/native/shim.h");
+
+    let configured = std::env::var_os("UMDK_INCLUDE_DIR").map(PathBuf::from);
+    let candidates = configured
+        .into_iter()
+        .flat_map(|path| [path.clone(), path.join("ub/umdk/urma")])
+        .chain([
+            PathBuf::from("/usr/include/ub/umdk/urma"),
+            PathBuf::from("/usr/local/include/ub/umdk/urma"),
+        ]);
+    let include = candidates
+        .into_iter()
+        .find(|path| path.join("urma_api.h").is_file())
+        .expect("p2p-urma requires urma_api.h; set UMDK_INCLUDE_DIR");
+
+    cc::Build::new()
+        .file("src/p2p/urma/native/shim.c")
+        .include(include)
+        .warnings(true)
+        .extra_warnings(true)
+        .compile("agentenv_urma_shim");
+
+    if let Some(lib) = std::env::var_os("UMDK_LIB_DIR") {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            PathBuf::from(lib).display()
+        );
+    }
+    println!("cargo:rustc-link-lib=dylib=urma");
+    println!("cargo:rustc-link-lib=dylib=dl");
 }
 
 fn emit_git_rerun_inputs() {

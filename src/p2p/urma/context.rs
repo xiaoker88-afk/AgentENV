@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 use super::ops::{
-    Completion, ContextConfig, CtxHandle, JfcHandle, JettyHandle, JettyId, UrmaOps,
+    Completion, ContextConfig, CtxHandle, JettyDescriptor, JettyHandle, JfcHandle, UrmaOps,
 };
 use crate::p2p::config::UrmaSettings;
 use crate::p2p::error::{Error as P2pError, Result as P2pResult};
@@ -95,7 +95,7 @@ impl UrmaContext {
             .create_jetty()
             .map_err(|e| P2pError::internal_message("urma bootstrap jetty", e))?;
         let mut context = bootstrap;
-        context.local_eid = bootstrap_id.eid;
+        context.local_eid = bootstrap_id.id.eid;
         Ok(context)
     }
 
@@ -113,17 +113,17 @@ impl UrmaContext {
     }
 
     /// Create an RM-mode duplex jetty on this context and return its advertised id.
-    pub fn create_jetty(&self) -> P2pResult<(JettyHandle, JettyId)> {
+    pub fn create_jetty(&self) -> P2pResult<(JettyHandle, JettyDescriptor)> {
         let jetty = self
             .ops
             .create_jetty(self.ctx, self.jfc)
             .map_err(|e| P2pError::internal_message("urma create_jetty", e))?;
-        let id = self
-            .ops
-            .jetty_id(jetty)
-            .map_err(|e| P2pError::internal_message("urma get_jetty_id", e))?;
+        let descriptor = self.ops.export_jetty(jetty).map_err(|e| {
+            let _ = self.ops.delete_jetty(jetty);
+            P2pError::internal_message("urma export_jetty", e)
+        })?;
         self.jetties.lock().unwrap().push(jetty);
-        Ok((jetty, id))
+        Ok((jetty, descriptor))
     }
 
     /// Create a short-lived RM connection jetty owned by the caller.
@@ -131,10 +131,16 @@ impl UrmaContext {
     /// Unlike [`Self::create_jetty`], this does not add the handle to the
     /// context-wide shutdown list: `PeerConnectionManager` deletes it when
     /// the imported peer connection is invalidated or expires.
-    pub(crate) fn create_connection_jetty(&self) -> P2pResult<JettyHandle> {
-        self.ops
+    pub(crate) fn create_connection_jetty(&self) -> P2pResult<(JettyHandle, JettyDescriptor)> {
+        let jetty = self
+            .ops
             .create_jetty(self.ctx, self.jfc)
-            .map_err(|e| P2pError::internal_message("urma create connection jetty", e))
+            .map_err(|e| P2pError::internal_message("urma create connection jetty", e))?;
+        let descriptor = self.ops.export_jetty(jetty).map_err(|e| {
+            let _ = self.ops.delete_jetty(jetty);
+            P2pError::internal_message("urma export connection jetty", e)
+        })?;
+        Ok((jetty, descriptor))
     }
 
     /// Allocate a fresh work request id for correlating completions.

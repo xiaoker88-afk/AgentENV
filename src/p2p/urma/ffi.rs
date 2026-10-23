@@ -50,6 +50,17 @@ pub const URMA_OPC_SEND: urma_opcode_t = 0x40;
 pub type urma_cr_status_t = i32;
 pub const URMA_CR_SUCCESS: urma_cr_status_t = 0;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct aenv_urma_import_diagnostics_t {
+    pub stage: u32,
+    pub native_status: i32,
+    pub system_errno: i32,
+    pub tp_count: u32,
+    pub tp_handle: u64,
+    pub tx_psn: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Access flag bit fields
 // ---------------------------------------------------------------------------
@@ -65,7 +76,8 @@ pub const URMA_ACCESS_ATOMIC: u32 = 0x1 << 3;
 /// so the access field starts at bit 5, token_id_valid at bit 13.
 pub const REG_SEG_FLAG_ACCESS_READ: u32 = URMA_ACCESS_READ << 5;
 /// READ|WRITE|ATOMIC — required for RECV buffers (data is written into them).
-pub const REG_SEG_FLAG_ACCESS_RW_ATOMIC: u32 = (URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC) << 5;
+pub const REG_SEG_FLAG_ACCESS_RW_ATOMIC: u32 =
+    (URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC) << 5;
 /// LOCAL_ONLY access — required for two-sided SEND/RECV buffers. Mutually
 /// exclusive with the remote-access bits (combined registration fails).
 pub const REG_SEG_FLAG_ACCESS_LOCAL_ONLY: u32 = URMA_ACCESS_LOCAL_ONLY << 5;
@@ -425,6 +437,29 @@ pub struct urma_target_seg_t {
 
 #[link(name = "urma")]
 extern "C" {
+    pub fn aenv_urma_export_jetty(
+        jetty: *mut urma_jetty_t,
+        data: *mut *mut u8,
+        length: *mut u32,
+    ) -> i32;
+    pub fn aenv_urma_create_ctp_jetty(
+        context: *mut urma_context_t,
+        jfc: *mut urma_jfc_t,
+        depth: u32,
+        token: u32,
+        jetty: *mut *mut urma_jetty_t,
+        jfr: *mut *mut urma_jfr_t,
+    ) -> i32;
+    pub fn aenv_urma_free_descriptor(data: *mut u8);
+    pub fn aenv_urma_import_ctp(
+        context: *mut urma_context_t,
+        data: *const u8,
+        length: u32,
+        token: u32,
+        target: *mut *mut urma_target_jetty_t,
+        diagnostics: *mut aenv_urma_import_diagnostics_t,
+    ) -> i32;
+
     /// Initialize the URMA environment. `conf == null` picks a random uasid.
     pub fn urma_init(conf: *mut urma_init_attr_t) -> urma_status_t;
     pub fn urma_uninit() -> urma_status_t;
@@ -437,18 +472,21 @@ extern "C" {
     pub fn urma_free_eid_list(eid_list: *mut urma_eid_info_t);
 
     // Context
-    pub fn urma_create_context(
-        dev: *mut urma_device_t,
-        eid_index: u32,
-    ) -> *mut urma_context_t;
+    pub fn urma_create_context(dev: *mut urma_device_t, eid_index: u32) -> *mut urma_context_t;
     pub fn urma_delete_context(ctx: *mut urma_context_t) -> urma_status_t;
 
     // JFC (completion queue)
-    pub fn urma_create_jfc(ctx: *mut urma_context_t, jfc_cfg: *mut urma_jfc_cfg_t) -> *mut urma_jfc_t;
+    pub fn urma_create_jfc(
+        ctx: *mut urma_context_t,
+        jfc_cfg: *mut urma_jfc_cfg_t,
+    ) -> *mut urma_jfc_t;
     pub fn urma_delete_jfc(jfc: *mut urma_jfc_t) -> urma_status_t;
 
     // Standalone JFR (receive jetty) for share_jfr jetty creation
-    pub fn urma_create_jfr(ctx: *mut urma_context_t, jfr_cfg: *mut urma_jfr_cfg_t) -> *mut urma_jfr_t;
+    pub fn urma_create_jfr(
+        ctx: *mut urma_context_t,
+        jfr_cfg: *mut urma_jfr_cfg_t,
+    ) -> *mut urma_jfr_t;
     pub fn urma_delete_jfr(jfr: *mut urma_jfr_t) -> urma_status_t;
 
     // Jetty (jfs + jfr pair)

@@ -71,6 +71,14 @@ pub struct JettyId {
     pub id: u32,
 }
 
+/// C-ABI remote Jetty descriptor exported by the provider-side shim.
+/// Consumers must treat `opaque` as an implementation detail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JettyDescriptor {
+    pub id: JettyId,
+    pub opaque: Vec<u8>,
+}
+
 /// Description of a segment published by a remote node, exchanged via the
 /// catalog (out-of-band): everything needed to `urma_import_seg` and issue
 /// one-sided READs against it.
@@ -206,7 +214,11 @@ pub trait UrmaOps: Send + Sync {
     fn list_devices(&self) -> OpsResult<Vec<String>>;
 
     /// Create a context (with one JFC) on the given device.
-    fn create_context(&self, device: &str, cfg: &ContextConfig) -> OpsResult<(CtxHandle, JfcHandle)>;
+    fn create_context(
+        &self,
+        device: &str,
+        cfg: &ContextConfig,
+    ) -> OpsResult<(CtxHandle, JfcHandle)>;
 
     fn delete_context(&self, ctx: CtxHandle) -> OpsResult<()>;
 
@@ -220,8 +232,14 @@ pub trait UrmaOps: Send + Sync {
     /// Query the local jetty id (EID + uasid + id) to advertise to peers.
     fn jetty_id(&self, jetty: JettyHandle) -> OpsResult<JettyId>;
 
+    fn export_jetty(&self, jetty: JettyHandle) -> OpsResult<JettyDescriptor>;
+
     /// Import a remote jetty so WRs can target it (RM connection setup).
-    fn import_jetty(&self, ctx: CtxHandle, remote: &JettyId) -> OpsResult<TargetJettyHandle>;
+    fn import_jetty(
+        &self,
+        ctx: CtxHandle,
+        remote: &JettyDescriptor,
+    ) -> OpsResult<TargetJettyHandle>;
 
     fn unimport_jetty(&self, tjetty: TargetJettyHandle) -> OpsResult<()>;
 
@@ -233,7 +251,8 @@ pub trait UrmaOps: Send + Sync {
     /// URMA access bits are mutually exclusive: LOCAL_ONLY grants local
     /// jetty ops while READ|WRITE|ATOMIC grants remote one-sided access;
     /// combining them fails registration (verified against hardware).
-    fn register_local_seg(&self, ctx: CtxHandle, addr: usize, len: u64) -> OpsResult<RegisteredSeg>;
+    fn register_local_seg(&self, ctx: CtxHandle, addr: usize, len: u64)
+        -> OpsResult<RegisteredSeg>;
 
     fn unregister_seg(&self, tseg: TargetSegHandle) -> OpsResult<()>;
 
@@ -301,7 +320,10 @@ impl RealUrmaOps {
         if !URMA_INITIALIZED.swap(true, Ordering::SeqCst) {
             let status = unsafe { ffi::urma_init(std::ptr::null_mut()) };
             if status != ffi::URMA_SUCCESS {
-                tracing::warn!(status, "urma_init failed (continuing; it may already be initialized)");
+                tracing::warn!(
+                    status,
+                    "urma_init failed (continuing; it may already be initialized)"
+                );
             }
         }
         Self {
@@ -319,7 +341,10 @@ impl RealUrmaOps {
 
     fn check_non_null<T>(operation: &'static str, ptr: *mut T) -> OpsResult<*mut T> {
         if ptr.is_null() {
-            Err(UrmaOpError { operation, status: -1 })
+            Err(UrmaOpError {
+                operation,
+                status: -1,
+            })
         } else {
             Ok(ptr)
         }
@@ -393,7 +418,10 @@ impl RealUrmaOps {
             {
                 let _ = ffi::urma_unregister_seg(tseg);
                 let _ = ffi::urma_free_token_id(token_id);
-                return Err(UrmaOpError { operation: "urma_get_seg_ctx", status: -6 });
+                return Err(UrmaOpError {
+                    operation: "urma_get_seg_ctx",
+                    status: -6,
+                });
             }
             let va = (*seg_ctx).ubva.va;
             let token = (*seg_ctx).token_id;
@@ -432,10 +460,16 @@ impl UrmaOps for RealUrmaOps {
         }
     }
 
-    fn create_context(&self, device: &str, cfg: &ContextConfig) -> OpsResult<(CtxHandle, JfcHandle)> {
+    fn create_context(
+        &self,
+        device: &str,
+        cfg: &ContextConfig,
+    ) -> OpsResult<(CtxHandle, JfcHandle)> {
         unsafe {
-            let cname = std::ffi::CString::new(device)
-                .map_err(|_| UrmaOpError { operation: "urma device name", status: -4 })?;
+            let cname = std::ffi::CString::new(device).map_err(|_| UrmaOpError {
+                operation: "urma device name",
+                status: -4,
+            })?;
             let dev = Self::check_non_null(
                 "urma_get_device_by_name",
                 ffi::urma_get_device_by_name(cname.as_ptr() as *mut _),
@@ -448,7 +482,10 @@ impl UrmaOps for RealUrmaOps {
                 if !eids.is_null() {
                     ffi::urma_free_eid_list(eids);
                 }
-                return Err(UrmaOpError { operation: "urma_get_eid_list", status: -5 });
+                return Err(UrmaOpError {
+                    operation: "urma_get_eid_list",
+                    status: -5,
+                });
             }
             let eid_index = (*eids).eid_index;
             ffi::urma_free_eid_list(eids);
@@ -467,13 +504,22 @@ impl UrmaOps for RealUrmaOps {
                 jfce: std::ptr::null_mut(),
                 user_ctx: 0,
             };
-            let jfc = Self::check_non_null("urma_create_jfc", ffi::urma_create_jfc(ctx, &mut jfc_cfg))?;
-            Ok((CtxHandle::from_raw(ctx as *mut c_void), JfcHandle::from_raw(jfc as *mut c_void)))
+            let jfc =
+                Self::check_non_null("urma_create_jfc", ffi::urma_create_jfc(ctx, &mut jfc_cfg))?;
+            Ok((
+                CtxHandle::from_raw(ctx as *mut c_void),
+                JfcHandle::from_raw(jfc as *mut c_void),
+            ))
         }
     }
 
     fn delete_context(&self, ctx: CtxHandle) -> OpsResult<()> {
-        unsafe { Self::check("urma_delete_context", ffi::urma_delete_context(ctx.as_ptr())) }
+        unsafe {
+            Self::check(
+                "urma_delete_context",
+                ffi::urma_delete_context(ctx.as_ptr()),
+            )
+        }
     }
 
     fn delete_jfc(&self, jfc: JfcHandle) -> OpsResult<()> {
@@ -484,57 +530,18 @@ impl UrmaOps for RealUrmaOps {
         unsafe {
             let ctx_ptr = ctx.as_ptr::<ffi::urma_context_t>();
             let jfc_ptr = jfc.as_ptr::<ffi::urma_jfc_t>();
-
-            // UB only supports share_jfr: create a standalone JFR and attach
-            // it through the jetty config's shared arm.
-            let mut jfr_cfg = ffi::urma_jfr_cfg_t {
-                id: 0,
-                depth: 64,
-                flag: 0,
-                trans_mode: ffi::URMA_TM_RM,
-                max_sge: 1,
-                min_rnr_timer: 12,
-                jfc: jfc_ptr,
-                token_value: ffi::urma_token_t { token: JETTY_TOKEN },
-                user_ctx: 0,
-            };
-            let jfr = Self::check_non_null("urma_create_jfr", ffi::urma_create_jfr(ctx_ptr, &mut jfr_cfg))?;
-
-            let mut jfs_cfg = ffi::urma_jfs_cfg_t {
-                depth: 64,
-                // bonding_dev RM is supported only as CTP multi-path. This
-                // must match the create-side configuration used by
-                // `urma_perftest --ctp`; import-side `tp_type` alone is not
-                // enough for the bonding provider to import the vjetty.
-                flag: ffi::JFS_FLAG_MULTI_PATH,
-                trans_mode: ffi::URMA_TM_RM,
-                priority: 0,
-                // The bonding provider consumes one additional SGE. Mirror
-                // urma_perftest's `use_bonding` resource configuration.
-                max_sge: 2,
-                max_rsge: 1,
-                max_inline_data: 0,
-                rnr_retry: 7,
-                err_timeout: 17,
-                jfc: jfc_ptr,
-                user_ctx: 0,
-            };
-            let mut jetty_cfg = ffi::urma_jetty_cfg_t {
-                id: 0,
-                flag: ffi::JETTY_FLAG_SHARE_JFR,
-                jfs_cfg,
-                recv: ffi::urma_jetty_recv_u {
-                    shared: ffi::urma_jetty_shared_t {
-                        jfr,
-                        jfc: jfc_ptr,
-                    },
-                },
-                jetty_grp: std::ptr::null_mut(),
-                user_ctx: 0,
-            };
-            let jetty = Self::check_non_null(
-                "urma_create_jetty",
-                ffi::urma_create_jetty(ctx_ptr, &mut jetty_cfg),
+            let mut jetty = std::ptr::null_mut();
+            let mut jfr = std::ptr::null_mut();
+            Self::check(
+                "aenv_urma_create_ctp_jetty",
+                ffi::aenv_urma_create_ctp_jetty(
+                    ctx_ptr,
+                    jfc_ptr,
+                    64,
+                    JETTY_TOKEN,
+                    &mut jetty,
+                    &mut jfr,
+                ),
             )?;
             let handle = JettyHandle::from_raw(jetty as *mut c_void);
             self.jetty_jfrs.lock().unwrap().insert(handle, JfrPtr(jfr));
@@ -567,49 +574,110 @@ impl UrmaOps for RealUrmaOps {
         }
     }
 
-    fn import_jetty(&self, ctx: CtxHandle, remote: &JettyId) -> OpsResult<TargetJettyHandle> {
+    fn export_jetty(&self, jetty: JettyHandle) -> OpsResult<JettyDescriptor> {
         unsafe {
-            let mut rjetty = ffi::urma_rjetty_t {
-                jetty_id: ffi::urma_jetty_id_t {
-                    eid: ffi::urma_eid_t { raw: remote.eid.0 },
-                    uasid: remote.uasid,
-                    id: remote.id,
-                },
-                trans_mode: ffi::URMA_TM_RM,
-                policy: 0,
-                type_: ffi::URMA_JETTY,
-                // CTP plane: required for RM import_jetty on UB hardware.
-                // RTP import returns EPERM (errno=1) because UB RM mode
-                // only exposes the CTP plane (rm_tp_cap.rtp=0). CTP import
-                // supports both one-sided READ/WRITE and two-sided SEND/RECV
-                // (verified empirically: READ 1MiB / WRITE 4KiB both succeed
-                // with status=0 on CTP).
-                flag: 0,
-                tp_type: ffi::URMA_CTP,
-            };
-            let mut token = ffi::urma_token_t { token: JETTY_TOKEN };
-            let tjetty = Self::check_non_null(
-                "urma_import_jetty",
-                ffi::urma_import_jetty(ctx.as_ptr(), &mut rjetty, &mut token),
+            let id = self.jetty_id(jetty)?;
+            let mut data = std::ptr::null_mut();
+            let mut length = 0u32;
+            Self::check(
+                "aenv_urma_export_jetty",
+                ffi::aenv_urma_export_jetty(jetty.as_ptr(), &mut data, &mut length),
             )?;
+            let opaque = std::slice::from_raw_parts(data, length as usize).to_vec();
+            ffi::aenv_urma_free_descriptor(data);
+            Ok(JettyDescriptor { id, opaque })
+        }
+    }
+
+    fn import_jetty(
+        &self,
+        ctx: CtxHandle,
+        remote: &JettyDescriptor,
+    ) -> OpsResult<TargetJettyHandle> {
+        unsafe {
+            let owned;
+            let opaque = if remote.opaque.is_empty() {
+                owned = ffi::urma_rjetty_t {
+                    jetty_id: ffi::urma_jetty_id_t {
+                        eid: ffi::urma_eid_t {
+                            raw: remote.id.eid.0,
+                        },
+                        uasid: remote.id.uasid,
+                        id: remote.id.id,
+                    },
+                    trans_mode: ffi::URMA_TM_RM,
+                    policy: 0,
+                    type_: ffi::URMA_JETTY,
+                    flag: 0,
+                    tp_type: ffi::URMA_CTP,
+                };
+                std::slice::from_raw_parts(
+                    (&owned as *const ffi::urma_rjetty_t).cast::<u8>(),
+                    std::mem::size_of::<ffi::urma_rjetty_t>(),
+                )
+            } else {
+                remote.opaque.as_slice()
+            };
+            let mut tjetty = std::ptr::null_mut();
+            let mut diagnostics = ffi::aenv_urma_import_diagnostics_t::default();
+            let status = ffi::aenv_urma_import_ctp(
+                ctx.as_ptr(),
+                opaque.as_ptr(),
+                opaque.len() as u32,
+                JETTY_TOKEN,
+                &mut tjetty,
+                &mut diagnostics,
+            );
+            if status != 0 || tjetty.is_null() {
+                tracing::warn!(
+                    stage = diagnostics.stage,
+                    native_status = diagnostics.native_status,
+                    errno = diagnostics.system_errno,
+                    tp_count = diagnostics.tp_count,
+                    tp_handle = diagnostics.tp_handle,
+                    tx_psn = diagnostics.tx_psn,
+                    remote_eid = %remote.id.eid.to_hex(),
+                    remote_jetty = remote.id.id,
+                    "urma CTP import failed"
+                );
+                return Err(UrmaOpError {
+                    operation: "aenv_urma_import_ctp",
+                    status: if status != 0 { status } else { -5 },
+                });
+            }
             Ok(TargetJettyHandle::from_raw(tjetty as *mut c_void))
         }
     }
 
     fn unimport_jetty(&self, tjetty: TargetJettyHandle) -> OpsResult<()> {
-        unsafe { Self::check("urma_unimport_jetty", ffi::urma_unimport_jetty(tjetty.as_ptr())) }
+        unsafe {
+            Self::check(
+                "urma_unimport_jetty",
+                ffi::urma_unimport_jetty(tjetty.as_ptr()),
+            )
+        }
     }
 
     fn register_seg(&self, ctx: CtxHandle, addr: usize, len: u64) -> OpsResult<RegisteredSeg> {
         self.register_seg_with_access(ctx, addr, len, false)
     }
 
-    fn register_local_seg(&self, ctx: CtxHandle, addr: usize, len: u64) -> OpsResult<RegisteredSeg> {
+    fn register_local_seg(
+        &self,
+        ctx: CtxHandle,
+        addr: usize,
+        len: u64,
+    ) -> OpsResult<RegisteredSeg> {
         self.register_seg_with_access(ctx, addr, len, true)
     }
 
     fn unregister_seg(&self, tseg: TargetSegHandle) -> OpsResult<()> {
-        unsafe { Self::check("urma_unregister_seg", ffi::urma_unregister_seg(tseg.as_ptr())) }
+        unsafe {
+            Self::check(
+                "urma_unregister_seg",
+                ffi::urma_unregister_seg(tseg.as_ptr()),
+            )
+        }
     }
 
     fn import_seg(&self, ctx: CtxHandle, remote: &RemoteSegInfo) -> OpsResult<ImportedSeg> {
@@ -666,8 +734,14 @@ impl UrmaOps for RealUrmaOps {
                 user_ctx: wr.wr_id,
                 op: ffi::urma_jfs_op_u {
                     rw: ffi::urma_rw_wr_t {
-                        src: ffi::urma_sg_t { sge: &mut src_sge, num_sge: 1 },
-                        dst: ffi::urma_sg_t { sge: &mut dst_sge, num_sge: 1 },
+                        src: ffi::urma_sg_t {
+                            sge: &mut src_sge,
+                            num_sge: 1,
+                        },
+                        dst: ffi::urma_sg_t {
+                            sge: &mut dst_sge,
+                            num_sge: 1,
+                        },
                         target_hint: 0,
                         notify_data: 0,
                     },
@@ -709,7 +783,10 @@ impl UrmaOps for RealUrmaOps {
                 user_ctx: wr.wr_id,
                 op: ffi::urma_jfs_op_u {
                     send: ffi::urma_send_wr_t {
-                        src: ffi::urma_sg_t { sge: &mut src_sge, num_sge: 1 },
+                        src: ffi::urma_sg_t {
+                            sge: &mut src_sge,
+                            num_sge: 1,
+                        },
                         target_hint: 0,
                         imm_data: 0,
                         tseg: std::ptr::null_mut(),
@@ -752,7 +829,10 @@ impl UrmaOps for RealUrmaOps {
             let mut crs = [std::mem::zeroed::<ffi::urma_cr_t>(); 16];
             let n = ffi::urma_poll_jfc(jfc.as_ptr(), crs.len() as i32, crs.as_mut_ptr());
             if n < 0 {
-                return Err(UrmaOpError { operation: "urma_poll_jfc", status: n });
+                return Err(UrmaOpError {
+                    operation: "urma_poll_jfc",
+                    status: n,
+                });
             }
             for cr in &crs[..n as usize] {
                 // cr.flag bit 0 marks a receive CR; only then is remote_id
@@ -894,9 +974,16 @@ impl UrmaOps for MockUrmaOps {
         Ok(self.status.lock().unwrap().devices.clone())
     }
 
-    fn create_context(&self, _device: &str, _cfg: &ContextConfig) -> OpsResult<(CtxHandle, JfcHandle)> {
+    fn create_context(
+        &self,
+        _device: &str,
+        _cfg: &ContextConfig,
+    ) -> OpsResult<(CtxHandle, JfcHandle)> {
         self.status.lock().unwrap().created_contexts += 1;
-        Ok((CtxHandle(self.alloc_handle()), JfcHandle(self.alloc_handle())))
+        Ok((
+            CtxHandle(self.alloc_handle()),
+            JfcHandle(self.alloc_handle()),
+        ))
     }
 
     fn delete_context(&self, _ctx: CtxHandle) -> OpsResult<()> {
@@ -927,19 +1014,30 @@ impl UrmaOps for MockUrmaOps {
         })
     }
 
-    fn import_jetty(&self, _ctx: CtxHandle, remote: &JettyId) -> OpsResult<TargetJettyHandle> {
+    fn export_jetty(&self, jetty: JettyHandle) -> OpsResult<JettyDescriptor> {
+        Ok(JettyDescriptor {
+            id: self.jetty_id(jetty)?,
+            opaque: vec![jetty.0 as u8; 16],
+        })
+    }
+
+    fn import_jetty(
+        &self,
+        _ctx: CtxHandle,
+        remote: &JettyDescriptor,
+    ) -> OpsResult<TargetJettyHandle> {
         let delay = self.status.lock().unwrap().import_delay;
         if !delay.is_zero() {
             std::thread::sleep(delay);
         }
         let tjetty = TargetJettyHandle(self.alloc_handle());
         let mut status = self.status.lock().unwrap();
-        status.jetties_imported.push(*remote);
+        status.jetties_imported.push(remote.id);
         // Mock jetty ids equal the raw handle value (see `jetty_id`), so the
         // remote jetty handle can be recovered from its advertised id.
         status
             .import_targets
-            .insert(tjetty, JettyHandle(remote.id as usize));
+            .insert(tjetty, JettyHandle(remote.id.id as usize));
         Ok(tjetty)
     }
 
@@ -955,10 +1053,20 @@ impl UrmaOps for MockUrmaOps {
         let key = 0xdead_beefu32 + handle.0 as u32;
         status.registered.push((addr, len));
         status.seg_windows.insert(handle, (addr, len, va));
-        Ok(RegisteredSeg { tseg: handle, local_va: addr as u64, ubva: va, key })
+        Ok(RegisteredSeg {
+            tseg: handle,
+            local_va: addr as u64,
+            ubva: va,
+            key,
+        })
     }
 
-    fn register_local_seg(&self, ctx: CtxHandle, addr: usize, len: u64) -> OpsResult<RegisteredSeg> {
+    fn register_local_seg(
+        &self,
+        ctx: CtxHandle,
+        addr: usize,
+        len: u64,
+    ) -> OpsResult<RegisteredSeg> {
         // Same as register_seg for the mock: LOCAL_ONLY vs remote access is
         // a hardware distinction only.
         self.register_seg(ctx, addr, len)
@@ -987,7 +1095,10 @@ impl UrmaOps for MockUrmaOps {
     fn post_read(&self, _jetty: JettyHandle, wr: &ReadWr) -> OpsResult<()> {
         let mut status = self.status.lock().unwrap();
         if status.read_failure != 0 {
-            return Err(UrmaOpError { operation: "urma_post_jetty_send_wr", status: status.read_failure });
+            return Err(UrmaOpError {
+                operation: "urma_post_jetty_send_wr",
+                status: status.read_failure,
+            });
         }
         status.reads.push(*wr);
         status.reads_log.push(*wr);
@@ -997,7 +1108,10 @@ impl UrmaOps for MockUrmaOps {
     fn post_send(&self, jetty: JettyHandle, wr: &MsgWr) -> OpsResult<()> {
         let mut status = self.status.lock().unwrap();
         if status.send_failure != 0 {
-            return Err(UrmaOpError { operation: "urma_post_jetty_send_wr", status: status.send_failure });
+            return Err(UrmaOpError {
+                operation: "urma_post_jetty_send_wr",
+                status: status.send_failure,
+            });
         }
         status.sends_log.push(*wr);
         let cf = status.completion_failure;

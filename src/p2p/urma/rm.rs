@@ -9,9 +9,12 @@ use std::time::Duration;
 
 use tracing::{debug, warn};
 
+use super::catalog::jetty_descriptor_from_address;
 use super::context::UrmaContext;
 use super::ctp::PeerConnectionManager;
-use super::ops::{Completion, Eid, JettyId, ReadWr, RemoteSegInfo, TargetSegHandle};
+use super::ops::{
+    Completion, Eid, JettyDescriptor, JettyId, ReadWr, RemoteSegInfo, TargetSegHandle,
+};
 use super::segment::{RemoteSegmentCache, UrmaLocator};
 use crate::p2p::error::{Error as P2pError, Result as P2pResult};
 
@@ -51,7 +54,11 @@ impl RmReader {
         local_base_va: u64,
         timeout: Duration,
     ) -> P2pResult<()> {
-        if offset.checked_add(len).map(|end| end > locator.len).unwrap_or(true) {
+        if offset
+            .checked_add(len)
+            .map(|end| end > locator.len)
+            .unwrap_or(true)
+        {
             return Err(P2pError::Internal(anyhow::anyhow!(
                 "urma: read range [{offset}, {offset}+{len}) out of bounds for segment of {} bytes",
                 locator.len
@@ -59,13 +66,24 @@ impl RmReader {
         }
 
         let remote_eid = Eid::from_hex(&locator.eid).ok_or_else(|| {
-            P2pError::Internal(anyhow::anyhow!("urma: invalid EID in locator: {:?}", locator.eid))
+            P2pError::Internal(anyhow::anyhow!(
+                "urma: invalid EID in locator: {:?}",
+                locator.eid
+            ))
         })?;
-        let remote_jetty = JettyId {
+        let fallback_id = JettyId {
             eid: remote_eid,
             uasid: locator.uasid,
             id: locator.jetty,
         };
+        let remote_jetty = locator
+            .jetty_descriptor
+            .as_deref()
+            .and_then(jetty_descriptor_from_address)
+            .unwrap_or(JettyDescriptor {
+                id: fallback_id,
+                opaque: Vec::new(),
+            });
         let remote_seg = RemoteSegInfo {
             eid: remote_eid,
             uasid: locator.uasid,
@@ -182,6 +200,7 @@ mod tests {
             eid: eid_hex.to_string(),
             uasid: 0x1000,
             jetty,
+            jetty_descriptor: None,
             va: 0x2000,
             key: 9,
             len,
@@ -249,7 +268,14 @@ mod tests {
 
         let remote = locator("22222222222222222222222222222222", 7, 4096);
         let err = reader
-            .read_range(&remote, 4000, 1000, TargetSegHandle(1), 0x9000, Duration::from_secs(1))
+            .read_range(
+                &remote,
+                4000,
+                1000,
+                TargetSegHandle(1),
+                0x9000,
+                Duration::from_secs(1),
+            )
             .await;
         assert!(err.is_err());
     }
@@ -262,7 +288,14 @@ mod tests {
 
         let remote = locator("22222222222222222222222222222222", 7, 4096);
         let result = reader
-            .read_range(&remote, 0, 100, TargetSegHandle(1), 0x9000, Duration::from_secs(5))
+            .read_range(
+                &remote,
+                0,
+                100,
+                TargetSegHandle(1),
+                0x9000,
+                Duration::from_secs(5),
+            )
             .await;
         assert!(result.is_err());
         assert_eq!(reader.connections.connection_count(), 0);

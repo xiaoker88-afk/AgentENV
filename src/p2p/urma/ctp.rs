@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::context::UrmaContext;
-use super::ops::{JettyHandle, JettyId, TargetJettyHandle};
+use super::ops::{JettyDescriptor, JettyHandle, TargetJettyHandle};
 use crate::p2p::error::{Error as P2pError, Result as P2pResult};
 
 /// An established (or being-established) connection to one remote peer,
@@ -34,6 +34,9 @@ pub struct PeerConnection {
     pub jetty: JettyHandle,
     /// Imported remote jetty handle.
     pub tjetty: TargetJettyHandle,
+    /// Descriptor for the local submission Jetty. Catalog requests carry it
+    /// so the peer can establish the reverse CTP target.
+    pub local_descriptor: JettyDescriptor,
     established_at: Instant,
     last_used: Arc<Mutex<Instant>>,
 }
@@ -74,10 +77,10 @@ impl PeerConnectionManager {
 
     /// Import one remote RM/CTP jetty. This is blocking FFI work and must run
     /// on a blocking thread when called from async code.
-    fn import_sync(&self, remote: &JettyId) -> P2pResult<PeerConnection> {
-        let key = remote.eid.to_hex();
+    fn import_sync(&self, remote: &JettyDescriptor) -> P2pResult<PeerConnection> {
+        let key = remote.id.eid.to_hex();
         let ops = self.context.ops();
-        let jetty = self
+        let (jetty, local_descriptor) = self
             .context
             .create_connection_jetty()
             .map_err(|e| P2pError::internal_message("urma connect: create_jetty", e))?;
@@ -96,6 +99,7 @@ impl PeerConnectionManager {
             remote_eid: key.clone(),
             jetty,
             tjetty,
+            local_descriptor,
             established_at: Instant::now(),
             last_used: Arc::new(Mutex::new(Instant::now())),
         };
@@ -115,9 +119,9 @@ impl PeerConnectionManager {
     /// caller has otherwise been cancelled.
     pub async fn ensure_connection(
         self: &Arc<Self>,
-        remote: &JettyId,
+        remote: &JettyDescriptor,
     ) -> P2pResult<PeerConnection> {
-        let key = remote.eid.to_hex();
+        let key = remote.id.eid.to_hex();
         {
             let connections = self.connections.lock().unwrap();
             if let Some(conn) = connections.get(&key) {
@@ -140,7 +144,7 @@ impl PeerConnectionManager {
                 return Ok(conn.clone());
             }
         }
-        let remote = *remote;
+        let remote = remote.clone();
         let blocking_self = Arc::clone(self);
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::task::spawn_blocking(move || {
@@ -222,15 +226,22 @@ impl PeerConnectionManager {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ops::{Eid, MockUrmaOps};
+    use super::super::ops::{Eid, JettyId, MockUrmaOps};
     use super::*;
 
-    fn remote_id() -> JettyId {
-        JettyId {
-            eid: Eid([0xaa; 16]),
-            uasid: 0x1000,
-            id: 7,
+    fn descriptor(eid: Eid, id: u32) -> JettyDescriptor {
+        JettyDescriptor {
+            id: JettyId {
+                eid,
+                uasid: 0x1000,
+                id,
+            },
+            opaque: vec![id as u8; 16],
         }
+    }
+
+    fn remote_id() -> JettyDescriptor {
+        descriptor(Eid([0xaa; 16]), 7)
     }
 
     #[tokio::test]
@@ -338,7 +349,11 @@ mod tests {
         // Sleep briefly so idle_for exceeds the 1ms TTL.
         std::thread::sleep(Duration::from_millis(10));
         manager.reap_idle();
-        assert_eq!(manager.connection_count(), 0, "idle connection must be reaped");
+        assert_eq!(
+            manager.connection_count(),
+            0,
+            "idle connection must be reaped"
+        );
 
         // Reconnect after reap: should establish fresh.
         manager.ensure_connection(&remote_id()).await.unwrap();
@@ -355,8 +370,8 @@ mod tests {
             Duration::from_secs(3600),
         ));
 
-        let peer_a = JettyId { eid: Eid([0xaa; 16]), uasid: 0x1000, id: 1 };
-        let peer_b = JettyId { eid: Eid([0xbb; 16]), uasid: 0x1000, id: 2 };
+        let peer_a = descriptor(Eid([0xaa; 16]), 1);
+        let peer_b = descriptor(Eid([0xbb; 16]), 2);
 
         let conn_a = manager.ensure_connection(&peer_a).await.unwrap();
         let conn_b = manager.ensure_connection(&peer_b).await.unwrap();
@@ -381,8 +396,8 @@ mod tests {
             Duration::from_secs(3600),
         ));
 
-        let peer_a = JettyId { eid: Eid([0xaa; 16]), uasid: 0x1000, id: 1 };
-        let peer_b = JettyId { eid: Eid([0xbb; 16]), uasid: 0x1000, id: 2 };
+        let peer_a = descriptor(Eid([0xaa; 16]), 1);
+        let peer_b = descriptor(Eid([0xbb; 16]), 2);
         manager.ensure_connection(&peer_a).await.unwrap();
         manager.ensure_connection(&peer_b).await.unwrap();
         assert_eq!(manager.connection_count(), 2);

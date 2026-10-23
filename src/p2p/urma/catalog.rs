@@ -33,7 +33,7 @@ use tracing::{debug, instrument, warn};
 
 use super::context::UrmaContext;
 use super::ctp::PeerConnectionManager;
-use super::ops::{Completion, JettyId, MsgWr, RegisteredSeg, TargetJettyHandle};
+use super::ops::{Completion, JettyDescriptor, JettyId, MsgWr, RegisteredSeg, TargetJettyHandle};
 use super::URMA_BACKEND_ID;
 use crate::p2p::error::{Error, Result};
 use crate::p2p::types::{P2pArtifactDescriptor, P2pArtifactKey, P2pPeer};
@@ -45,6 +45,9 @@ pub const CATALOG_BUF_SIZE: usize = 4096;
 #[derive(Serialize, Deserialize)]
 pub struct CatalogRequest {
     pub key: String,
+    /// Complete requester Jetty descriptor, needed by bonding CTP to send
+    /// the response back through `urma_import_jetty_ex`.
+    pub requester: String,
 }
 
 /// Catalog query response body.
@@ -56,12 +59,75 @@ pub struct CatalogResponse {
 /// Parse a `"<eid-hex>:<uasid>:<jetty-id>"` endpoint address into an RM
 /// target jetty id.
 pub fn jetty_id_from_address(address: &str) -> Option<JettyId> {
+    if let Some(descriptor) = jetty_descriptor_from_address(address) {
+        return Some(descriptor.id);
+    }
     let (eid_hex, rest) = address.split_once(':')?;
     let (uasid_str, jetty_str) = rest.split_once(':')?;
     let eid = super::ops::Eid::from_hex(eid_hex)?;
     let uasid = uasid_str.parse::<u32>().ok()?;
     let jetty = jetty_str.parse::<u32>().ok()?;
-    Some(JettyId { eid, uasid, id: jetty })
+    Some(JettyId {
+        eid,
+        uasid,
+        id: jetty,
+    })
+}
+
+const ENDPOINT_PREFIX: &str = "urma2:";
+
+#[derive(Serialize, Deserialize)]
+struct WireJettyDescriptor {
+    eid: String,
+    uasid: u32,
+    jetty: u32,
+    opaque: String,
+}
+
+pub fn jetty_descriptor_address(descriptor: &JettyDescriptor) -> String {
+    use base64::Engine;
+    let wire = WireJettyDescriptor {
+        eid: descriptor.id.eid.to_hex(),
+        uasid: descriptor.id.uasid,
+        jetty: descriptor.id.id,
+        opaque: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&descriptor.opaque),
+    };
+    let json = serde_json::to_vec(&wire).expect("Jetty descriptor serialization cannot fail");
+    format!(
+        "{ENDPOINT_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+    )
+}
+
+pub fn jetty_descriptor_from_address(address: &str) -> Option<JettyDescriptor> {
+    use base64::Engine;
+    if let Some(payload) = address.strip_prefix(ENDPOINT_PREFIX) {
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .ok()?;
+        let wire: WireJettyDescriptor = serde_json::from_slice(&json).ok()?;
+        let opaque = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(wire.opaque)
+            .ok()?;
+        return Some(JettyDescriptor {
+            id: JettyId {
+                eid: super::ops::Eid::from_hex(&wire.eid)?,
+                uasid: wire.uasid,
+                id: wire.jetty,
+            },
+            opaque,
+        });
+    }
+    let (eid_hex, rest) = address.split_once(':')?;
+    let (uasid_str, jetty_str) = rest.split_once(':')?;
+    Some(JettyDescriptor {
+        id: JettyId {
+            eid: super::ops::Eid::from_hex(eid_hex)?,
+            uasid: uasid_str.parse().ok()?,
+            id: jetty_str.parse().ok()?,
+        },
+        opaque: Vec::new(),
+    })
 }
 
 /// A registered 4KiB control buffer used as SEND source / RECV landing
@@ -82,7 +148,9 @@ impl ControlBuffer {
             .map_err(|e| Error::Internal(anyhow::anyhow!("urma: bad alloc layout: {e}")))?;
         let ptr = unsafe { alloc(layout) };
         if ptr.is_null() {
-            return Err(Error::Internal(anyhow::anyhow!("urma: failed to allocate page-aligned buffer")));
+            return Err(Error::Internal(anyhow::anyhow!(
+                "urma: failed to allocate page-aligned buffer"
+            )));
         }
         unsafe { std::ptr::write_bytes(ptr, 0, CATALOG_BUF_SIZE) };
         let addr = ptr as usize;
@@ -91,7 +159,9 @@ impl ControlBuffer {
             .register_local_seg(context.handle(), addr, CATALOG_BUF_SIZE as u64)
             .map_err(|e| {
                 // Free on registration failure.
-                unsafe { dealloc(ptr, layout); }
+                unsafe {
+                    dealloc(ptr, layout);
+                }
                 Error::internal_message("urma register catalog buffer", e)
             })?;
         Ok(Self { addr, registered })
@@ -201,7 +271,7 @@ impl RemoteCatalog for UrmaCatalog {
                 ),
             });
         }
-        let remote = jetty_id_from_address(&peer.endpoint.address).ok_or_else(|| {
+        let remote = jetty_descriptor_from_address(&peer.endpoint.address).ok_or_else(|| {
             Error::InvalidDescriptor {
                 reason: format!(
                     "malformed urma endpoint address: {:?}",
@@ -215,44 +285,58 @@ impl RemoteCatalog for UrmaCatalog {
         let mut recv_buf = self.lease().await?;
 
         let result = async {
-            let send_len = send_buf.write_json(&CatalogRequest { key: key.clone() })?;
+            let send_len = send_buf.write_json(&CatalogRequest {
+                key: key.clone(),
+                requester: jetty_descriptor_address(&conn.local_descriptor),
+            })?;
 
             // Pre-post the response landing buffer before the request goes
             // out so the peer's SEND cannot race past it.
             let recv_wr_id = self.context.alloc_wr_id();
             let recv_rx = self.context.subscribe(recv_wr_id);
-            self.context.ops().post_recv(
-                conn.jetty,
-                &MsgWr {
-                    wr_id: recv_wr_id,
-                    tjetty: conn.tjetty,
-                    local_tseg: recv_buf.registered.tseg,
-                    local_va: recv_buf.registered.local_va,
-                    len: CATALOG_BUF_SIZE as u32,
-                },
-            ).map_err(|e| Error::internal_message("urma post_recv", e))?;
+            self.context
+                .ops()
+                .post_recv(
+                    conn.jetty,
+                    &MsgWr {
+                        wr_id: recv_wr_id,
+                        tjetty: conn.tjetty,
+                        local_tseg: recv_buf.registered.tseg,
+                        local_va: recv_buf.registered.local_va,
+                        len: CATALOG_BUF_SIZE as u32,
+                    },
+                )
+                .map_err(|e| Error::internal_message("urma post_recv", e))?;
 
             let send_wr_id = self.context.alloc_wr_id();
             let send_rx = self.context.subscribe(send_wr_id);
-            self.context.ops().post_send(
-                conn.jetty,
-                &MsgWr {
-                    wr_id: send_wr_id,
-                    tjetty: conn.tjetty,
-                    local_tseg: send_buf.registered.tseg,
-                    local_va: send_buf.registered.local_va,
-                    len: send_len as u32,
-                },
-            ).map_err(|e| Error::internal_message("urma post_send", e))?;
+            self.context
+                .ops()
+                .post_send(
+                    conn.jetty,
+                    &MsgWr {
+                        wr_id: send_wr_id,
+                        tjetty: conn.tjetty,
+                        local_tseg: send_buf.registered.tseg,
+                        local_va: send_buf.registered.local_va,
+                        len: send_len as u32,
+                    },
+                )
+                .map_err(|e| Error::internal_message("urma post_send", e))?;
 
             let send_cqe = tokio::time::timeout(self.timeout, send_rx)
                 .await
-                .map_err(|_| Error::Internal(anyhow::anyhow!(
-                    "urma: catalog request send timed out after {:?}", self.timeout
-                )))?
-                .map_err(|_| Error::Internal(anyhow::anyhow!(
-                    "urma: catalog send completion channel closed"
-                )))?;
+                .map_err(|_| {
+                    Error::Internal(anyhow::anyhow!(
+                        "urma: catalog request send timed out after {:?}",
+                        self.timeout
+                    ))
+                })?
+                .map_err(|_| {
+                    Error::Internal(anyhow::anyhow!(
+                        "urma: catalog send completion channel closed"
+                    ))
+                })?;
             if send_cqe.status != 0 {
                 return Err(Error::Internal(anyhow::anyhow!(
                     "urma: catalog send completed with status {}",
@@ -262,12 +346,17 @@ impl RemoteCatalog for UrmaCatalog {
 
             let recv_cqe = tokio::time::timeout(self.timeout, recv_rx)
                 .await
-                .map_err(|_| Error::Internal(anyhow::anyhow!(
-                    "urma: catalog response timed out after {:?}", self.timeout
-                )))?
-                .map_err(|_| Error::Internal(anyhow::anyhow!(
-                    "urma: catalog recv completion channel closed"
-                )))?;
+                .map_err(|_| {
+                    Error::Internal(anyhow::anyhow!(
+                        "urma: catalog response timed out after {:?}",
+                        self.timeout
+                    ))
+                })?
+                .map_err(|_| {
+                    Error::Internal(anyhow::anyhow!(
+                        "urma: catalog recv completion channel closed"
+                    ))
+                })?;
             if recv_cqe.status != 0 {
                 return Err(Error::Internal(anyhow::anyhow!(
                     "urma: catalog recv completed with status {}",
@@ -275,12 +364,12 @@ impl RemoteCatalog for UrmaCatalog {
                 )));
             }
 
-            let response = recv_buf
-                .read_json(recv_cqe.len as usize)
-                .ok_or_else(|| Error::Internal(anyhow::anyhow!(
+            let response = recv_buf.read_json(recv_cqe.len as usize).ok_or_else(|| {
+                Error::Internal(anyhow::anyhow!(
                     "urma: malformed catalog response ({} bytes)",
                     recv_cqe.len
-                )))?;
+                ))
+            })?;
             Ok(response.descriptor)
         }
         .await;
@@ -505,7 +594,15 @@ async fn handle_request(
         if let Some(handle) = jetties.get(&client) {
             *handle
         } else {
-            match context.ops().import_jetty(context.handle(), &client) {
+            let Some(descriptor) = jetty_descriptor_from_address(&request.requester) else {
+                warn!("urma: catalog request carried malformed requester descriptor");
+                return;
+            };
+            if descriptor.id != client {
+                warn!("urma: catalog requester descriptor does not match receive completion");
+                return;
+            }
+            match context.ops().import_jetty(context.handle(), &descriptor) {
                 Ok(handle) => {
                     jetties.insert(client, handle);
                     handle
@@ -587,6 +684,21 @@ mod tests {
     }
 
     #[test]
+    fn provider_jetty_descriptor_roundtrip() {
+        let descriptor = JettyDescriptor {
+            id: JettyId {
+                eid: super::super::ops::Eid([0x42; 16]),
+                uasid: 17,
+                id: 1030,
+            },
+            opaque: (0..64).collect(),
+        };
+        let address = jetty_descriptor_address(&descriptor);
+        assert!(address.starts_with("urma2:"));
+        assert_eq!(jetty_descriptor_from_address(&address), Some(descriptor));
+    }
+
+    #[test]
     fn catalog_message_codec_roundtrip() {
         let ops = super::super::ops::MockUrmaOps::new();
         let context = UrmaContext::mock(ops).unwrap();
@@ -606,7 +718,9 @@ mod tests {
         assert_eq!(parsed.descriptor.as_ref().unwrap().key, "k1");
 
         // Miss case: descriptor is null.
-        let len = buf.write_json(&CatalogResponse { descriptor: None }).unwrap();
+        let len = buf
+            .write_json(&CatalogResponse { descriptor: None })
+            .unwrap();
         let parsed = buf.read_json(len).unwrap();
         assert!(parsed.descriptor.is_none());
     }
@@ -617,6 +731,11 @@ mod tests {
         let context = UrmaContext::mock(ops).unwrap();
         let mut buf = ControlBuffer::new(&context).unwrap();
         let big = "x".repeat(CATALOG_BUF_SIZE * 2);
-        assert!(buf.write_json(&CatalogRequest { key: big }).is_err());
+        assert!(buf
+            .write_json(&CatalogRequest {
+                key: big,
+                requester: "urma2:test".to_string(),
+            })
+            .is_err());
     }
 }

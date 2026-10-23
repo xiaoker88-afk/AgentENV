@@ -1,4 +1,4 @@
-﻿//! Segment management: publish-side registry, wire locator codec and
+//! Segment management: publish-side registry, wire locator codec and
 //! import-side remote segment cache.
 //!
 //! A published artifact is registered as a URMA segment covering its bytes
@@ -13,8 +13,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
+use super::catalog::jetty_descriptor_address;
 use super::context::UrmaContext;
-use super::ops::{Eid, ImportedSeg, JettyId, RemoteSegInfo, TargetSegHandle};
+use super::ops::{Eid, ImportedSeg, JettyDescriptor, RemoteSegInfo, TargetSegHandle};
 use crate::p2p::error::{Error as P2pError, Result as P2pResult};
 
 /// Prefix identifying URMA locators in `backend_locator` strings.
@@ -30,6 +31,10 @@ pub struct UrmaLocator {
     pub uasid: u32,
     /// Jetty id on the home node serving one-sided READs.
     pub jetty: u32,
+    /// Versioned provider descriptor used for CTP import. Optional only for
+    /// decoding locators produced by pre-descriptor AgentENV builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jetty_descriptor: Option<String>,
     /// Segment base UBVA on the home node.
     pub va: u64,
     /// Access token for one-sided READ.
@@ -79,9 +84,7 @@ impl LruClock {
 }
 
 /// Evict the least-recently-used entry from `map` and return it.
-fn evict_lru<K: std::hash::Hash + Eq + Clone, T>(
-    map: &mut HashMap<K, LruSlot<T>>,
-) -> Option<T> {
+fn evict_lru<K: std::hash::Hash + Eq + Clone, T>(map: &mut HashMap<K, LruSlot<T>>) -> Option<T> {
     let victim = map
         .iter()
         .min_by_key(|(_, slot)| slot.last_used)
@@ -94,17 +97,21 @@ pub struct SegmentRegistry {
     context: Arc<UrmaContext>,
     /// Jetty (id) on this node that consumers target for one-sided READs.
     /// RM is connectionless, so a single serve jetty serves every consumer.
-    serve_jetty_id: JettyId,
+    serve_jetty: JettyDescriptor,
     max_segments: usize,
     segments: Mutex<HashMap<String, LruSlot<PublishedSegment>>>,
     clock: LruClock,
 }
 
 impl SegmentRegistry {
-    pub fn new(context: Arc<UrmaContext>, serve_jetty_id: JettyId, max_segments: usize) -> Self {
+    pub fn new(
+        context: Arc<UrmaContext>,
+        serve_jetty: JettyDescriptor,
+        max_segments: usize,
+    ) -> Self {
         Self {
             context,
-            serve_jetty_id,
+            serve_jetty,
             max_segments: max_segments.max(1),
             segments: Mutex::new(HashMap::new()),
             clock: LruClock::default(),
@@ -113,12 +120,7 @@ impl SegmentRegistry {
 
     /// Register `[addr, addr+len)` as a published segment under `key` and
     /// return the wire locator to advertise.
-    pub fn publish(
-        &self,
-        key: &str,
-        addr: usize,
-        len: u64,
-    ) -> P2pResult<UrmaLocator> {
+    pub fn publish(&self, key: &str, addr: usize, len: u64) -> P2pResult<UrmaLocator> {
         if len == 0 {
             return Err(P2pError::Internal(anyhow::anyhow!(
                 "urma: refusing to publish empty segment for {key}"
@@ -137,12 +139,13 @@ impl SegmentRegistry {
             .ops()
             .register_seg(self.context.handle(), addr, len)
             .map_err(|e| P2pError::internal_message("urma register_seg", e))?;
-        let serve = self.serve_jetty_id;
+        let serve = &self.serve_jetty;
 
         let locator = UrmaLocator {
-            eid: serve.eid.to_hex(),
-            uasid: serve.uasid,
-            jetty: serve.id,
+            eid: serve.id.eid.to_hex(),
+            uasid: serve.id.uasid,
+            jetty: serve.id.id,
+            jetty_descriptor: Some(jetty_descriptor_address(serve)),
             va: registered.ubva,
             key: registered.key,
             len,
@@ -309,7 +312,7 @@ impl RemoteSegmentCache {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ops::{Eid, JettyId, MockUrmaOps};
+    use super::super::ops::{Eid, JettyDescriptor, MockUrmaOps};
     use super::*;
 
     fn remote_seg() -> RemoteSegInfo {
@@ -322,11 +325,14 @@ mod tests {
         }
     }
 
-    fn serve_id() -> JettyId {
-        JettyId {
-            eid: Eid([0x33; 16]),
-            uasid: 0x2000,
-            id: 9,
+    fn serve_id() -> JettyDescriptor {
+        JettyDescriptor {
+            id: super::super::ops::JettyId {
+                eid: Eid([0x33; 16]),
+                uasid: 0x2000,
+                id: 9,
+            },
+            opaque: vec![9; 16],
         }
     }
 
@@ -336,6 +342,7 @@ mod tests {
             eid: "1111".to_string(),
             uasid: 0x1000,
             jetty: 5,
+            jetty_descriptor: None,
             va: 0xdead_beef,
             key: 7,
             len: 1 << 20,
@@ -438,7 +445,10 @@ mod tests {
         assert_eq!(cache.len(), 2);
         let status = ops.status.lock().unwrap();
         assert_eq!(status.segs_imported.len(), 3);
-        assert_eq!(status.unimported_segs, 1, "one import must be LRU-unimported");
+        assert_eq!(
+            status.unimported_segs, 1,
+            "one import must be LRU-unimported"
+        );
     }
 
     #[tokio::test]
@@ -455,7 +465,9 @@ mod tests {
         assert!(registry.locator("k1").is_none());
 
         let buf2 = vec![2u8; 4096];
-        let l2 = registry.publish("k1", buf2.as_ptr() as usize, 4096).unwrap();
+        let l2 = registry
+            .publish("k1", buf2.as_ptr() as usize, 4096)
+            .unwrap();
         // The two locators should differ because the second publish allocates
         // a new VA from the mock.
         assert_ne!(l1.va, l2.va, "republish must allocate a new segment");

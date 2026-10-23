@@ -126,6 +126,7 @@ openssl-sys = { version = "0.9", optional = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"
+cc = "1"
 
 [profile.dev.package.sha2]
 opt-level = 3

@@ -22,7 +22,7 @@ use futures::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, instrument, warn};
 
-use super::catalog::{CatalogServer, RemoteCatalog, UrmaCatalog};
+use super::catalog::{jetty_descriptor_address, CatalogServer, RemoteCatalog, UrmaCatalog};
 use super::context::UrmaContext;
 use super::ctp::PeerConnectionManager;
 use super::ops::UrmaOps;
@@ -71,9 +71,8 @@ impl LocalArtifact {
     /// remote pullers can parse `LayerMetadata` from the descriptor.
     fn metadata(&self) -> &serde_json::Value {
         match self {
-            LocalArtifact::Reference { metadata, .. } | LocalArtifact::InMemory { metadata, .. } => {
-                metadata
-            }
+            LocalArtifact::Reference { metadata, .. }
+            | LocalArtifact::InMemory { metadata, .. } => metadata,
         }
     }
 }
@@ -122,7 +121,10 @@ mod file_map {
                         std::io::Error::last_os_error(),
                     ));
                 }
-                Ok(FileMap { addr: ptr as usize, len })
+                Ok(FileMap {
+                    addr: ptr as usize,
+                    len,
+                })
             }
             #[cfg(not(unix))]
             {
@@ -167,7 +169,9 @@ mod file_map {
         fn drop(&mut self) {
             if self.len > 0 {
                 #[cfg(unix)]
-                unsafe { libc::munmap(self.addr as *mut libc::c_void, self.len) };
+                unsafe {
+                    libc::munmap(self.addr as *mut libc::c_void, self.len)
+                };
                 #[cfg(not(unix))]
                 unreachable!("FileMap with len > 0 only exists on unix");
             }
@@ -193,8 +197,7 @@ mod aligned_buf {
         pub fn new(data: &[u8]) -> Self {
             let len = data.len();
             let alloc_size = ((len + 4095) / 4096) * 4096;
-            let layout =
-                std::alloc::Layout::from_size_align(alloc_size.max(1), 4096).unwrap();
+            let layout = std::alloc::Layout::from_size_align(alloc_size.max(1), 4096).unwrap();
             let ptr = unsafe { std::alloc::alloc(layout) };
             if ptr.is_null() {
                 std::alloc::handle_alloc_error(layout);
@@ -291,11 +294,11 @@ impl UrmaP2pTransport {
         // Serve jetty: remote consumers import this jetty (RM, connectionless)
         // before issuing one-sided READs against published segments. The same
         // jetty also serves catalog SEND/RECV requests (M2).
-        let (serve_jetty, serve_jetty_id) = context.create_jetty()?;
+        let (serve_jetty, serve_jetty_descriptor) = context.create_jetty()?;
 
         let registry = Arc::new(SegmentRegistry::new(
             context.clone(),
-            serve_jetty_id,
+            serve_jetty_descriptor.clone(),
             settings.max_segments,
         ));
 
@@ -316,12 +319,7 @@ impl UrmaP2pTransport {
 
         let local_endpoint = P2pEndpoint {
             backend: URMA_BACKEND_ID.to_string(),
-            address: format!(
-                "{}:{}:{}",
-                serve_jetty_id.eid.to_hex(),
-                serve_jetty_id.uasid,
-                serve_jetty_id.id
-            ),
+            address: jetty_descriptor_address(&serve_jetty_descriptor),
         };
 
         // Catalog server: resolve remote queries against the local registry.
@@ -407,11 +405,13 @@ impl UrmaP2pTransport {
     }
 
     fn locator_from_descriptor(&self, descriptor: &P2pArtifactDescriptor) -> Result<UrmaLocator> {
-        let raw = descriptor.backend_locator.as_deref().ok_or_else(|| {
-            Error::InvalidDescriptor {
-                reason: "missing urma backend locator".to_string(),
-            }
-        })?;
+        let raw =
+            descriptor
+                .backend_locator
+                .as_deref()
+                .ok_or_else(|| Error::InvalidDescriptor {
+                    reason: "missing urma backend locator".to_string(),
+                })?;
         UrmaLocator::decode(raw).ok_or_else(|| Error::InvalidDescriptor {
             reason: format!("malformed urma backend locator: {raw}"),
         })
@@ -441,9 +441,7 @@ impl UrmaP2pTransport {
                 };
                 Ok(Some(buf.slice(start, Some(end - start))))
             }
-            Some(LocalArtifact::Reference { map, .. }) => {
-                Ok(Some(map.slice(offset, len)?))
-            }
+            Some(LocalArtifact::Reference { map, .. }) => Ok(Some(map.slice(offset, len)?)),
             None => Ok(None),
         }
     }
@@ -451,12 +449,7 @@ impl UrmaP2pTransport {
     /// Stream `[offset, offset+len)` of the remote segment described by
     /// `locator` as a sequence of at-most-`MAX_BOUNCE_WINDOW` byte chunks.
     /// The bounce buffer is registered once and reused for all windows.
-    fn remote_chunk_stream(
-        &self,
-        locator: UrmaLocator,
-        offset: u64,
-        len: u64,
-    ) -> P2pByteStream {
+    fn remote_chunk_stream(&self, locator: UrmaLocator, offset: u64, len: u64) -> P2pByteStream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(STREAM_CHANNEL_CAPACITY);
         let context = self.context.clone();
         let reader = self.reader.clone();
@@ -495,7 +488,9 @@ impl UrmaP2pTransport {
             if bounce_addr == 0 {
                 record_stream("error", streamed, stream_start);
                 let _ = tx
-                    .send(Err(Error::Internal(anyhow::anyhow!("urma: bounce alloc failed"))))
+                    .send(Err(Error::Internal(anyhow::anyhow!(
+                        "urma: bounce alloc failed"
+                    ))))
                     .await;
                 return;
             }
@@ -553,8 +548,13 @@ impl UrmaP2pTransport {
                 );
                 streamed += chunk_len;
                 let end = chunk_len as usize;
-                let bounce_slice = unsafe { std::slice::from_raw_parts(bounce_addr as *const u8, end) };
-                if tx.send(Ok(Bytes::copy_from_slice(bounce_slice))).await.is_err() {
+                let bounce_slice =
+                    unsafe { std::slice::from_raw_parts(bounce_addr as *const u8, end) };
+                if tx
+                    .send(Ok(Bytes::copy_from_slice(bounce_slice)))
+                    .await
+                    .is_err()
+                {
                     status = "dropped"; // consumer dropped the stream
                     record_stream(status, streamed, stream_start);
                     break;
@@ -636,9 +636,7 @@ impl UrmaP2pTransport {
         len: usize,
     ) -> Result<P2pByteStream> {
         if let Some(bytes) = self.local_slice(&descriptor.key, offset, Some(len))? {
-            return Ok(Box::pin(futures::stream::once(async move {
-                Ok(bytes)
-            })));
+            return Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })));
         }
 
         let locator = self.locator_from_descriptor(descriptor)?;
@@ -664,7 +662,10 @@ impl UrmaP2pTransport {
                 Vec::new()
             }
         };
-        for peer in peers.iter().filter(|p| p.endpoint.backend == URMA_BACKEND_ID) {
+        for peer in peers
+            .iter()
+            .filter(|p| p.endpoint.backend == URMA_BACKEND_ID)
+        {
             // Retry up to 3 times with 300ms intervals to cover the URMA SEND
             // cold-start window (~1s) where the first SEND after import_jetty
             // is silently dropped by the UB hardware.  The hardware-level
@@ -805,11 +806,9 @@ impl P2pTransport for UrmaP2pTransport {
         // In-memory fallback: read the bytes (if Path) and copy them into
         // a 4K-aligned buffer so `register_seg` accepts the address.
         let data = match &request.source {
-            P2pPublishSource::Path(path) => {
-                tokio::fs::read(path)
-                    .await
-                    .map_err(|e| Error::internal_message("read publish source", e))?
-            }
+            P2pPublishSource::Path(path) => tokio::fs::read(path)
+                .await
+                .map_err(|e| Error::internal_message("read publish source", e))?,
             P2pPublishSource::Bytes(bytes) => bytes.as_ref().to_vec(),
         };
         let buf = aligned_buf::AlignedBuf::new(&data);
@@ -898,6 +897,7 @@ mod tests {
             eid: "22222222222222222222222222222222".to_string(),
             uasid: 0x1000,
             jetty: 7,
+            jetty_descriptor: None,
             va: 0x2000,
             key: 9,
             len,
@@ -1020,7 +1020,8 @@ mod tests {
         let b = transport_named(ops.clone(), "node-b");
 
         let payload = Bytes::from_static(b"shared artifact bytes");
-        a.publish(&P2pPublishRequest::bytes("k1", payload)).await
+        a.publish(&P2pPublishRequest::bytes("k1", payload))
+            .await
             .unwrap();
 
         // b has no local copy; a hint points at a's advertised URMA endpoint.
@@ -1037,8 +1038,7 @@ mod tests {
             .unwrap()
             .expect("remote catalog should resolve k1");
         assert_eq!(descriptor.key, "k1");
-        let locator =
-            UrmaLocator::decode(descriptor.backend_locator.as_deref().unwrap()).unwrap();
+        let locator = UrmaLocator::decode(descriptor.backend_locator.as_deref().unwrap()).unwrap();
         // The locator advertises a's serve jetty, not b's.
         assert_eq!(locator.eid, "11111111111111111111111111111111");
 
@@ -1050,12 +1050,11 @@ mod tests {
         }
 
         // Miss: an unknown key must come back as None (descriptor: null).
-        assert!(
-            b.lookup_with_hints(&"missing".to_string(), &hints)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(b
+            .lookup_with_hints(&"missing".to_string(), &hints)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // Ignored: same shared-mock completion routing issue as above.
@@ -1118,7 +1117,10 @@ mod tests {
         let transport = transport(ops);
 
         let result = transport.unpublish(&"ghost".to_string()).await.unwrap();
-        assert!(!result, "unpublishing a never-published key must return false");
+        assert!(
+            !result,
+            "unpublishing a never-published key must return false"
+        );
     }
 
     #[tokio::test]
@@ -1127,7 +1129,10 @@ mod tests {
         let transport = transport(ops.clone());
 
         let payload = Bytes::from_static(b"first version");
-        transport.publish(&P2pPublishRequest::bytes("k1", payload.clone())).await.unwrap();
+        transport
+            .publish(&P2pPublishRequest::bytes("k1", payload.clone()))
+            .await
+            .unwrap();
         assert!(transport.lookup(&"k1".to_string()).await.unwrap().is_some());
 
         // Unpublish removes the artifact.
@@ -1136,7 +1141,10 @@ mod tests {
 
         // Republish with different content succeeds.
         let payload2 = Bytes::from_static(b"second version");
-        transport.publish(&P2pPublishRequest::bytes("k1", payload2.clone())).await.unwrap();
+        transport
+            .publish(&P2pPublishRequest::bytes("k1", payload2.clone()))
+            .await
+            .unwrap();
         let descriptor = transport.lookup(&"k1".to_string()).await.unwrap().unwrap();
         let fetched = transport.fetch_bytes(&descriptor).await.unwrap();
         assert_eq!(fetched, payload2);
