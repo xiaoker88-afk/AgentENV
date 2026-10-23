@@ -29,6 +29,14 @@ use std::time::Duration;
 /// liburma.
 pub const URMA_EID_LEN: usize = 16;
 
+/// Shared Jetty/JFR token used by both the create and import paths.
+///
+/// UMDK's perftest uses the same non-zero token (`0xABCDEF`) on both peers.
+/// A zero token lets the local bonding vjetty be created on some releases,
+/// but the remote `import_vjetty` ioctl rejects it.
+#[cfg(feature = "p2p-urma")]
+const JETTY_TOKEN: u32 = 0x00ab_cdef;
+
 /// Unified Bus endpoint identifier of a node.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Eid(pub [u8; URMA_EID_LEN]);
@@ -487,7 +495,7 @@ impl UrmaOps for RealUrmaOps {
                 max_sge: 1,
                 min_rnr_timer: 12,
                 jfc: jfc_ptr,
-                token_value: ffi::urma_token_t { token: 0 },
+                token_value: ffi::urma_token_t { token: JETTY_TOKEN },
                 user_ctx: 0,
             };
             let jfr = Self::check_non_null("urma_create_jfr", ffi::urma_create_jfr(ctx_ptr, &mut jfr_cfg))?;
@@ -579,7 +587,7 @@ impl UrmaOps for RealUrmaOps {
                 flag: 0,
                 tp_type: ffi::URMA_CTP,
             };
-            let mut token = ffi::urma_token_t { token: 0 };
+            let mut token = ffi::urma_token_t { token: JETTY_TOKEN };
             let tjetty = Self::check_non_null(
                 "urma_import_jetty",
                 ffi::urma_import_jetty(ctx.as_ptr(), &mut rjetty, &mut token),
