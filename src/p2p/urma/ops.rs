@@ -129,7 +129,7 @@ opaque_handle!(TokenIdHandle);
 opaque_handle!(TargetSegHandle);
 
 /// A locally registered segment plus the info peers need to read it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RegisteredSeg {
     pub tseg: TargetSegHandle,
     /// Local virtual address (the `seg_cfg.va` passed to `urma_register_seg`).
@@ -139,6 +139,9 @@ pub struct RegisteredSeg {
     pub ubva: u64,
     /// Access token id (advertised to peers).
     pub key: u32,
+    /// Complete provider descriptor returned by `urma_get_seg_ctx`. Bonding
+    /// devices append per-slave EIDs and token ids after `urma_seg_t`.
+    pub descriptor: Vec<u8>,
 }
 
 /// An imported remote segment plus its local mapping address. One-sided
@@ -258,7 +261,12 @@ pub trait UrmaOps: Send + Sync {
 
     /// Import a remote segment for local one-sided access (RM). The
     /// returned [`ImportedSeg::mva`] is the base address for READs.
-    fn import_seg(&self, ctx: CtxHandle, remote: &RemoteSegInfo) -> OpsResult<ImportedSeg>;
+    fn import_seg(
+        &self,
+        ctx: CtxHandle,
+        remote: &RemoteSegInfo,
+        descriptor: Option<&[u8]>,
+    ) -> OpsResult<ImportedSeg>;
 
     fn unimport_seg(&self, tseg: TargetSegHandle) -> OpsResult<()>;
 
@@ -404,6 +412,7 @@ impl RealUrmaOps {
                     local_va: addr as u64,
                     ubva: 0,
                     key: 0,
+                    descriptor: Vec::new(),
                 });
             }
             // Serialize the segment to learn its UBVA + token id.
@@ -425,12 +434,15 @@ impl RealUrmaOps {
             }
             let va = (*seg_ctx).ubva.va;
             let token = (*seg_ctx).token_id;
+            let descriptor =
+                std::slice::from_raw_parts(seg_ctx.cast::<u8>(), size as usize).to_vec();
             ffi::urma_put_seg_ctx(seg_ctx);
             Ok(RegisteredSeg {
                 tseg: TargetSegHandle::from_raw(tseg as *mut c_void),
                 local_va: addr as u64,
                 ubva: va,
                 key: token,
+                descriptor,
             })
         }
     }
@@ -680,8 +692,35 @@ impl UrmaOps for RealUrmaOps {
         }
     }
 
-    fn import_seg(&self, ctx: CtxHandle, remote: &RemoteSegInfo) -> OpsResult<ImportedSeg> {
+    fn import_seg(
+        &self,
+        ctx: CtxHandle,
+        remote: &RemoteSegInfo,
+        descriptor: Option<&[u8]>,
+    ) -> OpsResult<ImportedSeg> {
         unsafe {
+            if let Some(descriptor) = descriptor {
+                let length = u32::try_from(descriptor.len()).map_err(|_| UrmaOpError {
+                    operation: "aenv_urma_import_seg",
+                    status: -22,
+                })?;
+                let mut tseg = std::ptr::null_mut();
+                Self::check(
+                    "aenv_urma_import_seg",
+                    ffi::aenv_urma_import_seg(
+                        ctx.as_ptr(),
+                        descriptor.as_ptr(),
+                        length,
+                        0,
+                        &mut tseg,
+                    ),
+                )?;
+                let tseg = Self::check_non_null("aenv_urma_import_seg", tseg)?;
+                return Ok(ImportedSeg {
+                    tseg: TargetSegHandle::from_raw(tseg as *mut c_void),
+                    mva: remote.va,
+                });
+            }
             let mut seg = ffi::urma_seg_t {
                 ubva: ffi::urma_ubva_t {
                     eid: remote.eid.0,
@@ -1061,6 +1100,7 @@ impl UrmaOps for MockUrmaOps {
             local_va: addr as u64,
             ubva: va,
             key,
+            descriptor: Vec::new(),
         })
     }
 
@@ -1080,7 +1120,12 @@ impl UrmaOps for MockUrmaOps {
         Ok(())
     }
 
-    fn import_seg(&self, _ctx: CtxHandle, remote: &RemoteSegInfo) -> OpsResult<ImportedSeg> {
+    fn import_seg(
+        &self,
+        _ctx: CtxHandle,
+        remote: &RemoteSegInfo,
+        _descriptor: Option<&[u8]>,
+    ) -> OpsResult<ImportedSeg> {
         self.status.lock().unwrap().segs_imported.push(*remote);
         // The mock maps the remote segment identity-style: reads address
         // the same advertised va.

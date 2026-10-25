@@ -458,6 +458,13 @@ extern "C" {
         target: *mut *mut urma_target_jetty_t,
         diagnostics: *mut aenv_urma_import_diagnostics_t,
     ) -> i32;
+    pub fn aenv_urma_import_seg(
+        context: *mut urma_context_t,
+        data: *const u8,
+        length: u32,
+        token: u32,
+        target: *mut *mut urma_target_seg_t,
+    ) -> i32;
 
     /// Initialize the URMA environment. `conf == null` picks a random uasid.
     pub fn urma_init(conf: *mut urma_init_attr_t) -> urma_status_t;

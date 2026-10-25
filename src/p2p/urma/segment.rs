@@ -35,6 +35,10 @@ pub struct UrmaLocator {
     /// decoding locators produced by pre-descriptor AgentENV builds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jetty_descriptor: Option<String>,
+    /// Complete provider segment descriptor. B131 bonding providers append
+    /// per-slave routing/token data required for import without vseg CP RPCs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_descriptor: Option<String>,
     /// Segment base UBVA on the home node.
     pub va: u64,
     /// Access token for one-sided READ.
@@ -146,6 +150,8 @@ impl SegmentRegistry {
             uasid: serve.id.uasid,
             jetty: serve.id.id,
             jetty_descriptor: Some(jetty_descriptor_address(serve)),
+            segment_descriptor: (!registered.descriptor.is_empty())
+                .then(|| URL_SAFE_NO_PAD.encode(&registered.descriptor)),
             va: registered.ubva,
             key: registered.key,
             len,
@@ -259,6 +265,7 @@ impl RemoteSegmentCache {
         &self,
         context: &UrmaContext,
         remote: &RemoteSegInfo,
+        descriptor: Option<&[u8]>,
     ) -> P2pResult<ImportedSeg> {
         {
             let mut imported = self.imported.lock().unwrap();
@@ -269,7 +276,7 @@ impl RemoteSegmentCache {
         }
         let seg = context
             .ops()
-            .import_seg(context.handle(), remote)
+            .import_seg(context.handle(), remote, descriptor)
             .map_err(|e| P2pError::internal_message("urma import_seg", e))?;
         let mut imported = self.imported.lock().unwrap();
         while imported.len() >= self.max_imported {
@@ -343,6 +350,7 @@ mod tests {
             uasid: 0x1000,
             jetty: 5,
             jetty_descriptor: None,
+            segment_descriptor: Some(URL_SAFE_NO_PAD.encode([1u8, 2, 3, 4])),
             va: 0xdead_beef,
             key: 7,
             len: 1 << 20,
@@ -392,8 +400,8 @@ mod tests {
         let context = Arc::new(UrmaContext::mock(ops.clone()).unwrap());
         let cache = RemoteSegmentCache::new();
 
-        let h1 = cache.get_or_import(&context, &remote_seg()).unwrap();
-        let h2 = cache.get_or_import(&context, &remote_seg()).unwrap();
+        let h1 = cache.get_or_import(&context, &remote_seg(), None).unwrap();
+        let h2 = cache.get_or_import(&context, &remote_seg(), None).unwrap();
         assert_eq!(h1, h2);
 
         let status = ops.status.lock().unwrap();
@@ -436,11 +444,11 @@ mod tests {
         let s2 = mk(2);
         let s3 = mk(3);
 
-        cache.get_or_import(&context, &s1).unwrap();
-        cache.get_or_import(&context, &s2).unwrap();
+        cache.get_or_import(&context, &s1, None).unwrap();
+        cache.get_or_import(&context, &s2, None).unwrap();
         // Touch s1 so s2 is the LRU victim once s3 arrives.
-        cache.get_or_import(&context, &s1).unwrap();
-        cache.get_or_import(&context, &s3).unwrap();
+        cache.get_or_import(&context, &s1, None).unwrap();
+        cache.get_or_import(&context, &s3, None).unwrap();
 
         assert_eq!(cache.len(), 2);
         let status = ops.status.lock().unwrap();
@@ -508,9 +516,9 @@ mod tests {
             key,
             len: 4096,
         };
-        cache.get_or_import(&context, &mk(1)).unwrap();
-        cache.get_or_import(&context, &mk(2)).unwrap();
-        cache.get_or_import(&context, &mk(3)).unwrap();
+        cache.get_or_import(&context, &mk(1), None).unwrap();
+        cache.get_or_import(&context, &mk(2), None).unwrap();
+        cache.get_or_import(&context, &mk(3), None).unwrap();
         assert_eq!(cache.len(), 3);
 
         cache.clear(&context);

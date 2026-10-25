@@ -899,6 +899,7 @@ mod tests {
             uasid: 0x1000,
             jetty: 7,
             jetty_descriptor: None,
+            segment_descriptor: None,
             va: 0x2000,
             key: 9,
             len,

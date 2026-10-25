@@ -7,6 +7,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use tracing::{debug, warn};
 
 use super::catalog::jetty_descriptor_from_address;
@@ -91,6 +93,12 @@ impl RmReader {
             key: locator.key,
             len: locator.len,
         };
+        let segment_descriptor = match locator.segment_descriptor.as_deref() {
+            Some(encoded) => Some(URL_SAFE_NO_PAD.decode(encoded).map_err(|err| {
+                P2pError::internal_message("urma: invalid segment descriptor", err)
+            })?),
+            None => None,
+        };
 
         // 1. Import the remote jetty (cached per peer).
         let conn = match self.connections.ensure_connection(&remote_jetty).await {
@@ -108,7 +116,11 @@ impl RmReader {
 
         // 2. Import the remote segment (cached per EID/VA/key); READs
         //    address the remote memory through the imported mapping.
-        let imported = match self.remote_cache.get_or_import(&self.context, &remote_seg) {
+        let imported = match self.remote_cache.get_or_import(
+            &self.context,
+            &remote_seg,
+            segment_descriptor.as_deref(),
+        ) {
             Ok(imported) => imported,
             Err(err) => {
                 warn!(
@@ -201,6 +213,7 @@ mod tests {
             uasid: 0x1000,
             jetty,
             jetty_descriptor: None,
+            segment_descriptor: None,
             va: 0x2000,
             key: 9,
             len,
@@ -237,6 +250,7 @@ mod tests {
             local_va: 0x9000,
             ubva: 0,
             key: 1,
+            descriptor: Vec::new(),
         };
         // 6000 bytes with 4096-byte chunks => 2 reads (4096 + 1904).
         reader

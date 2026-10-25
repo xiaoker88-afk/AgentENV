@@ -217,3 +217,32 @@ int aenv_urma_import_ctp(urma_context_t *context, const uint8_t *data,
     diagnostics->stage = AENV_IMPORT_NONE;
     return 0;
 }
+
+int aenv_urma_import_seg(urma_context_t *context, const uint8_t *data,
+                         uint32_t length, uint32_t token,
+                         urma_target_seg_t **target)
+{
+    urma_import_seg_flag_t flag = {0};
+    urma_token_t token_value = {.token = token};
+    urma_seg_t *descriptor;
+
+    if (context == NULL || data == NULL || length < sizeof(urma_seg_t) ||
+        target == NULL) {
+        return -EINVAL;
+    }
+    *target = NULL;
+    descriptor = malloc(length);
+    if (descriptor == NULL) {
+        return -ENOMEM;
+    }
+    memcpy(descriptor, data, length);
+    flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC;
+    flag.bs.mapping = URMA_SEG_NOMAP;
+    errno = 0;
+    *target = urma_import_seg(context, descriptor, &token_value, 0, flag);
+    free(descriptor);
+    if (*target == NULL) {
+        return pointer_error(-EIO);
+    }
+    return 0;
+}

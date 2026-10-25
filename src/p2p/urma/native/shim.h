@@ -8,6 +8,7 @@ typedef struct urma_jetty urma_jetty_t;
 typedef struct urma_jfc urma_jfc_t;
 typedef struct urma_jfr urma_jfr_t;
 typedef struct urma_target_jetty urma_target_jetty_t;
+typedef struct urma_target_seg urma_target_seg_t;
 
 typedef struct aenv_urma_import_diagnostics {
     uint32_t stage;
@@ -28,5 +29,8 @@ int aenv_urma_import_ctp(urma_context_t *context, const uint8_t *data,
                          uint32_t length, uint32_t token,
                          urma_target_jetty_t **target,
                          aenv_urma_import_diagnostics_t *diagnostics);
+int aenv_urma_import_seg(urma_context_t *context, const uint8_t *data,
+                         uint32_t length, uint32_t token,
+                         urma_target_seg_t **target);
 
 #endif
