@@ -358,10 +358,10 @@ impl RealUrmaOps {
         }
     }
 
-    /// Register `[addr, addr+len)` with either remote (RW|ATOMIC + token) or
+    /// Register `[addr, addr+len)` with either remote (READ + token) or
     /// local (LOCAL_ONLY) access. The two flag sets are mutually exclusive in
     /// URMA: two-sided SEND/RECV buffers require LOCAL_ONLY, while one-sided
-    /// remote access requires READ|WRITE|ATOMIC plus a published token.
+    /// remote access requires READ plus a published plain-text token.
     fn register_seg_with_access(
         &self,
         ctx: CtxHandle,
@@ -382,7 +382,9 @@ impl RealUrmaOps {
             let flag_val = if local {
                 ffi::REG_SEG_FLAG_ACCESS_LOCAL_ONLY
             } else {
-                ffi::REG_SEG_FLAG_ACCESS_RW_ATOMIC | ffi::REG_SEG_FLAG_TOKEN_ID_VALID
+                ffi::REG_SEG_FLAG_ACCESS_READ
+                    | ffi::REG_SEG_FLAG_TOKEN_PLAIN_TEXT
+                    | ffi::REG_SEG_FLAG_TOKEN_ID_VALID
             };
             let mut cfg = ffi::urma_seg_cfg_t {
                 va: addr as u64,
@@ -689,7 +691,7 @@ impl UrmaOps for RealUrmaOps {
                     va: remote.va,
                 },
                 len: remote.len,
-                attr: ffi::REG_SEG_FLAG_ACCESS_READ,
+                attr: ffi::REG_SEG_FLAG_ACCESS_READ | ffi::REG_SEG_FLAG_TOKEN_PLAIN_TEXT,
                 token_id: remote.key,
             };
             let mut token = ffi::urma_token_t { token: 0 };
