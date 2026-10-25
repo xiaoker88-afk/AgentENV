@@ -193,7 +193,13 @@ int aenv_urma_import_ctp(urma_context_t *context, const uint8_t *data,
         *target = urma_import_jetty_ex(context, remote, &token_value,
                                        &active_cfg);
         diagnostics->system_errno = errno;
-    } else if (status != URMA_SUCCESS && errno == ENOMEM) {
+    } else if (status == URMA_EINVAL ||
+               (status != URMA_SUCCESS && errno == ENOMEM)) {
+        /* Some bonding deployments support automatic CTP import but reject
+         * the explicit TP-aware get_tp_list path with URMA_EINVAL. This is
+         * the same non-TP-aware path used by `urma_perftest --ctp`, and is
+         * known to work on those providers. ENOMEM likewise means no TP
+         * handle was assignable, so let the provider select it internally. */
         diagnostics->stage = AENV_IMPORT_FALLBACK;
         errno = 0;
         *target = urma_import_jetty(context, remote, &token_value);
