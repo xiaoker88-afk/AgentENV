@@ -358,10 +358,10 @@ impl RealUrmaOps {
         }
     }
 
-    /// Register `[addr, addr+len)` with either remote (READ + token) or
+    /// Register `[addr, addr+len)` with either remote (RW|ATOMIC + token) or
     /// local (LOCAL_ONLY) access. The two flag sets are mutually exclusive in
     /// URMA: two-sided SEND/RECV buffers require LOCAL_ONLY, while one-sided
-    /// remote access requires READ plus a published plain-text token.
+    /// remote access requires READ|WRITE|ATOMIC plus a published token.
     fn register_seg_with_access(
         &self,
         ctx: CtxHandle,
@@ -382,9 +382,7 @@ impl RealUrmaOps {
             let flag_val = if local {
                 ffi::REG_SEG_FLAG_ACCESS_LOCAL_ONLY
             } else {
-                ffi::REG_SEG_FLAG_ACCESS_READ
-                    | ffi::REG_SEG_FLAG_TOKEN_PLAIN_TEXT
-                    | ffi::REG_SEG_FLAG_TOKEN_ID_VALID
+                ffi::REG_SEG_FLAG_ACCESS_RW_ATOMIC | ffi::REG_SEG_FLAG_TOKEN_ID_VALID
             };
             let mut cfg = ffi::urma_seg_cfg_t {
                 va: addr as u64,
@@ -691,7 +689,10 @@ impl UrmaOps for RealUrmaOps {
                     va: remote.va,
                 },
                 len: remote.len,
-                attr: ffi::REG_SEG_FLAG_ACCESS_READ | ffi::REG_SEG_FLAG_TOKEN_PLAIN_TEXT,
+                // Keep the reconstructed descriptor identical to the source
+                // registration. The bonding provider rejects a vseg import
+                // when these access capabilities differ.
+                attr: ffi::REG_SEG_FLAG_ACCESS_RW_ATOMIC,
                 token_id: remote.key,
             };
             let mut token = ffi::urma_token_t { token: 0 };
@@ -699,7 +700,7 @@ impl UrmaOps for RealUrmaOps {
             // remote UBVA directly (`ImportedSeg::mva` = remote va). A mapped
             // import would require a local ummu mapping whose base (`mva`)
             // is provider-assigned and may be 0, which breaks READ addressing.
-            let flag = ffi::IMPORT_SEG_FLAG_ACCESS_READ;
+            let flag = ffi::IMPORT_SEG_FLAG_ACCESS_RW_ATOMIC;
             let tseg = Self::check_non_null(
                 "urma_import_seg",
                 ffi::urma_import_seg(ctx.as_ptr(), &mut seg, &mut token, 0, flag),

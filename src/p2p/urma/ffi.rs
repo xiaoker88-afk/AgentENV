@@ -68,13 +68,14 @@ pub struct aenv_urma_import_diagnostics_t {
 /// Raw access capabilities (`URMA_ACCESS_*`).
 pub const URMA_ACCESS_LOCAL_ONLY: u32 = 0x1;
 pub const URMA_ACCESS_READ: u32 = 0x1 << 1;
-pub const URMA_TOKEN_PLAIN_TEXT: u32 = 1;
+pub const URMA_ACCESS_WRITE: u32 = 0x1 << 2;
+pub const URMA_ACCESS_ATOMIC: u32 = 0x1 << 3;
 
 /// `urma_reg_seg_flag_t` / `urma_seg_attr_t` bit layout:
 /// token_policy:3 | cacheable:1 | dsva:1 | **access:6** | non_pin:1 | user_iova:1 | **token_id_valid:1** | reserved:18
 /// so the access field starts at bit 5, token_id_valid at bit 13.
-pub const REG_SEG_FLAG_ACCESS_READ: u32 = URMA_ACCESS_READ << 5;
-pub const REG_SEG_FLAG_TOKEN_PLAIN_TEXT: u32 = URMA_TOKEN_PLAIN_TEXT;
+pub const REG_SEG_FLAG_ACCESS_RW_ATOMIC: u32 =
+    (URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC) << 5;
 /// LOCAL_ONLY access — required for two-sided SEND/RECV buffers. Mutually
 /// exclusive with the remote-access bits (combined registration fails).
 pub const REG_SEG_FLAG_ACCESS_LOCAL_ONLY: u32 = URMA_ACCESS_LOCAL_ONLY << 5;
@@ -82,7 +83,8 @@ pub const REG_SEG_FLAG_TOKEN_ID_VALID: u32 = 1 << 13;
 
 /// `urma_import_seg_flag_t` bit layout:
 /// cacheable:1 | **access:6** | **mapping:1** | reserved:24.
-pub const IMPORT_SEG_FLAG_ACCESS_READ: u32 = URMA_ACCESS_READ << 1;
+pub const IMPORT_SEG_FLAG_ACCESS_RW_ATOMIC: u32 =
+    (URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC) << 1;
 pub const IMPORT_SEG_FLAG_MAPPED: u32 = 1 << 7;
 
 /// `urma_jfs_wr_flag_t` bit layout:

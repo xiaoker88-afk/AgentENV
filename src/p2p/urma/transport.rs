@@ -495,20 +495,21 @@ impl UrmaP2pTransport {
                 return;
             }
             unsafe { std::ptr::write_bytes(bounce_addr as *mut u8, 0, window as usize) };
-            let registered = match context
-                .ops()
-                .register_seg(context.handle(), bounce_addr, window)
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    unsafe { std::alloc::dealloc(bounce_addr as *mut u8, layout) };
-                    record_stream("error", streamed, stream_start);
-                    let _ = tx
-                        .send(Err(Error::internal_message("urma register bounce", e)))
-                        .await;
-                    return;
-                }
-            };
+            let registered =
+                match context
+                    .ops()
+                    .register_local_seg(context.handle(), bounce_addr, window)
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        unsafe { std::alloc::dealloc(bounce_addr as *mut u8, layout) };
+                        record_stream("error", streamed, stream_start);
+                        let _ = tx
+                            .send(Err(Error::internal_message("urma register bounce", e)))
+                            .await;
+                        return;
+                    }
+                };
             let mut remaining = len;
             let mut pos = offset;
             while remaining > 0 {
