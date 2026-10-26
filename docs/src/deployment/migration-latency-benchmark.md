@@ -424,6 +424,40 @@ echo $?
 
 如果在非 root 用户下运行，本机日志采集要求无交互的 `sudo` 权限；node-b 日志采集要求 SSH 用户可以直接执行 `journalctl`。完整日志可能包含运行环境信息，复制到其他环境前应自行检查。
 
+#### 压缩单轮日志供离线分析
+
+当测试目录已经包含 `run-info.json` 和 `logs/*.log`（也兼容目录名 `log`）时，可以将完整日志压缩成一个只含迁移关键数据的文件：
+
+```bash
+python3 scripts/summarize-migration-run.py \
+  artifacts/migration-runs/20261026-143000-c4
+```
+
+默认输出：
+
+```text
+artifacts/migration-runs/20261026-143000-c4/migration-summary.json
+```
+
+该文件包含：
+
+- 本轮镜像、并发数、整批创建和迁移耗时；
+- 每个 sandbox 对应的 migration ID、snapshot ID 和客户端结果；
+- 每个 sandbox 的 Gateway 外层阶段和 node-a/node-b Runtime 细阶段；
+- P2P 成功、P2P miss/error、OSS 成功以及是否观察到 OSS 回退；
+- 各阶段样本数、平均值、P50、P95、最小值和最大值；
+- 事件解析失败、无法关联和缺少 `migration_total` 等诊断信息。
+
+脚本自动从日志识别 `iroh` 或 `urma`。如果测试窗口内没有包含足够的后端日志，可以显式补充标签：
+
+```bash
+python3 scripts/summarize-migration-run.py \
+  artifacts/migration-runs/20261026-143000-c4 \
+  --transport urma
+```
+
+它只读取原始目录，不删除或修改原日志。需要汇总多轮实验时，只复制每个目录生成的 `migration-summary.json` 即可，无需复制三份完整日志。
+
 ### 10.2 迁移已经存在的沙箱
 
 仓库提供：
