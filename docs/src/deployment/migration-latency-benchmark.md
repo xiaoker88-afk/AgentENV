@@ -364,6 +364,68 @@ git status --short
 
 ## 10. 执行并发迁移
 
+### 10.1 从创建沙箱开始的一键测试
+
+如果希望每轮都创建全新的独立沙箱，并自动保存这一轮的完整服务日志，可以使用：
+
+```text
+scripts/run-migration-test.py
+```
+
+脚本只要求 API Key 环境变量、完整镜像地址和并发数：
+
+```bash
+export AENV_API_KEY='实际 API Key'
+
+python3 scripts/run-migration-test.py \
+  --concurrency 4 \
+  --image 141.61.17.188:5000/agentenv-lab/sandbox-small:v1
+```
+
+`--concurrency 4` 表示先在 node-a 顺序创建四个不同沙箱，确认 Gateway 能解析它们的源节点后，同时向 node-b 发出四个迁移请求。创建耗时单独记录，不计入 `migration_batch_duration_ms`。
+
+针对当前双节点环境，默认值为：
+
+| 项目 | 默认值 | 覆盖环境变量 |
+|---|---|---|
+| node-a Runtime | `http://141.61.17.188:8000` | `AENV_BENCH_SOURCE_RUNTIME` |
+| Gateway | `http://127.0.0.1:8081` | `AENV_BENCH_GATEWAY` |
+| 目标节点 ID | `node-b` | `AENV_BENCH_TARGET_NODE` |
+| node-b SSH | `root@10.10.10.2` | `AENV_BENCH_TARGET_SSH` |
+| Gateway 服务 | `aenv-gateway` | `AENV_BENCH_GATEWAY_UNIT` |
+| Runtime 服务 | `agentenv` | `AENV_BENCH_RUNTIME_UNIT` |
+
+运行前确认 node-a 能免密访问 node-b：
+
+```bash
+ssh -o BatchMode=yes root@10.10.10.2 true
+```
+
+每轮生成一个独立目录：
+
+```text
+artifacts/migration-runs/20261026-143000-c4/
+├── run-info.json
+└── logs/
+    ├── gateway.log
+    ├── node-a.log
+    └── node-b.log
+```
+
+脚本在测试前记录三个 systemd journal cursor，结束时保存 cursor 之后的完整服务日志，因此不依赖两台节点时钟完全一致。`run-info.json` 保存镜像、并发数、沙箱 ID、创建结果、迁移响应和整批耗时，但不会保存 `AENV_API_KEY`。
+
+任意创建或迁移失败时，脚本仍会先采集三份日志，然后以非零状态退出：
+
+```bash
+echo $?
+```
+
+`0` 表示全部迁移成功；非零表示服务检查、创建、迁移或日志采集失败。脚本不会自动删除测试沙箱：成功的沙箱保留在 node-b，失败后应根据 `run-info.json` 检查沙箱实际所在节点。
+
+如果在非 root 用户下运行，本机日志采集要求无交互的 `sudo` 权限；node-b 日志采集要求 SSH 用户可以直接执行 `journalctl`。完整日志可能包含运行环境信息，复制到其他环境前应自行检查。
+
+### 10.2 迁移已经存在的沙箱
+
 仓库提供：
 
 ```text
