@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument, warn, Instrument};
 
 use super::catalog::{jetty_descriptor_address, CatalogServer, RemoteCatalog, UrmaCatalog};
 use super::context::UrmaContext;
@@ -28,6 +28,7 @@ use super::ctp::PeerConnectionManager;
 use super::ops::UrmaOps;
 use super::rm::RmReader;
 use super::segment::{RemoteSegmentCache, SegmentRegistry, UrmaLocator, URMA_LOCATOR_PREFIX};
+use super::timing::StageTimer;
 use super::URMA_BACKEND_ID;
 use crate::p2p::config::ResolvedP2pConfig;
 use crate::p2p::discovery::P2pPeerDiscovery;
@@ -449,13 +450,32 @@ impl UrmaP2pTransport {
     /// Stream `[offset, offset+len)` of the remote segment described by
     /// `locator` as a sequence of at-most-`MAX_BOUNCE_WINDOW` byte chunks.
     /// The bounce buffer is registered once and reused for all windows.
-    fn remote_chunk_stream(&self, locator: UrmaLocator, offset: u64, len: u64) -> P2pByteStream {
+    fn remote_chunk_stream(
+        &self,
+        key: &str,
+        locator: UrmaLocator,
+        offset: u64,
+        len: u64,
+    ) -> P2pByteStream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(STREAM_CHANNEL_CAPACITY);
         let context = self.context.clone();
         let reader = self.reader.clone();
         let fetch_timeout = self.fetch_timeout;
-        tokio::spawn(async move {
+        let key = key.to_owned();
+        let scheduled = Instant::now();
+        let stream_span = tracing::info_span!("urma_stream", key = %key);
+        let stream = async move {
+            info!(
+                key,
+                offset,
+                bytes = len,
+                duration_ms = scheduled.elapsed().as_secs_f64() * 1000.0,
+                stage = "stream_spawn_wait",
+                "urma stage timing"
+            );
+            let stream_timer = StageTimer::start(&key, "stream_total");
             if len == 0 {
+                stream_timer.finish();
                 return;
             }
             let stream_start = Instant::now();
@@ -481,6 +501,7 @@ impl UrmaP2pTransport {
                     "urma data stream finished"
                 );
             };
+            let prepare_timer = StageTimer::start(&key, "bounce_allocate_register");
             let window = len.min(MAX_BOUNCE_WINDOW);
             // URMA requires page-aligned buffers for register_seg.
             let layout = std::alloc::Layout::from_size_align(window as usize, 4096).unwrap();
@@ -510,11 +531,20 @@ impl UrmaP2pTransport {
                         return;
                     }
                 };
+            prepare_timer.finish();
             let mut remaining = len;
             let mut pos = offset;
             while remaining > 0 {
                 let chunk_len = remaining.min(window);
                 let read_start = Instant::now();
+                let read_timer = StageTimer::start(&key, "read_window");
+                info!(
+                    key,
+                    offset = pos,
+                    bytes = chunk_len,
+                    remote_va = locator.va,
+                    "urma read window started"
+                );
                 if let Err(err) = reader
                     .read_range(
                         &locator,
@@ -531,6 +561,7 @@ impl UrmaP2pTransport {
                     let _ = tx.send(Err(err)).await;
                     break;
                 }
+                read_timer.finish();
                 crate::p2p::obs::record_read_window(
                     URMA_BACKEND_ID,
                     chunk_len,
@@ -551,6 +582,7 @@ impl UrmaP2pTransport {
                 let end = chunk_len as usize;
                 let bounce_slice =
                     unsafe { std::slice::from_raw_parts(bounce_addr as *const u8, end) };
+                let delivery_timer = StageTimer::start(&key, "stream_copy_deliver");
                 if tx
                     .send(Ok(Bytes::copy_from_slice(bounce_slice)))
                     .await
@@ -560,15 +592,22 @@ impl UrmaP2pTransport {
                     record_stream(status, streamed, stream_start);
                     break;
                 }
+                delivery_timer.finish();
                 pos += chunk_len;
                 remaining -= chunk_len;
             }
             if status == "ok" {
                 record_stream(status, streamed, stream_start);
             }
+            let cleanup_timer = StageTimer::start(&key, "bounce_unregister_free");
             let _ = context.ops().unregister_seg(registered.tseg);
             unsafe { std::alloc::dealloc(bounce_addr as *mut u8, layout) };
-        });
+            cleanup_timer.finish();
+            if status == "ok" {
+                stream_timer.finish();
+            }
+        };
+        tokio::spawn(stream.instrument(stream_span));
         Box::pin(ReceiverStream::new(rx))
     }
     async fn fetch_inner(
@@ -590,6 +629,7 @@ impl UrmaP2pTransport {
 
         let locator = self.locator_from_descriptor(descriptor)?;
         let total_len = locator.len;
+        let file_timer = StageTimer::start(&descriptor.key, "fetch_file_create");
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -598,19 +638,24 @@ impl UrmaP2pTransport {
         let mut file = tokio::fs::File::create(destination)
             .await
             .map_err(|e| Error::internal_message("create fetch destination file", e))?;
+        file_timer.finish();
         use tokio::io::AsyncWriteExt;
         let mut total = 0u64;
-        let mut stream = self.remote_chunk_stream(locator, 0, total_len);
+        let mut stream = self.remote_chunk_stream(&descriptor.key, locator, 0, total_len);
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
+            let write_timer = StageTimer::start(&descriptor.key, "fetch_file_write");
             file.write_all(&chunk)
                 .await
                 .map_err(|e| Error::internal_message("write fetched chunk", e))?;
+            write_timer.finish();
             total += chunk.len() as u64;
         }
+        let flush_timer = StageTimer::start(&descriptor.key, "fetch_file_flush");
         file.flush()
             .await
             .map_err(|e| Error::internal_message("flush fetched artifact", e))?;
+        flush_timer.finish();
         debug!(size = total, "fetched artifact via urma one-sided reads");
         Ok(total)
     }
@@ -623,7 +668,7 @@ impl UrmaP2pTransport {
         let locator = self.locator_from_descriptor(descriptor)?;
         let total_len = locator.len;
         let mut collected = Vec::with_capacity(total_len.min(MAX_BOUNCE_WINDOW) as usize);
-        let mut stream = self.remote_chunk_stream(locator, 0, total_len);
+        let mut stream = self.remote_chunk_stream(&descriptor.key, locator, 0, total_len);
         while let Some(chunk) = stream.next().await {
             collected.extend_from_slice(&chunk?);
         }
@@ -641,7 +686,7 @@ impl UrmaP2pTransport {
         }
 
         let locator = self.locator_from_descriptor(descriptor)?;
-        Ok(self.remote_chunk_stream(locator, offset, len as u64))
+        Ok(self.remote_chunk_stream(&descriptor.key, locator, offset, len as u64))
     }
 
     async fn lookup_with_hints_inner(
@@ -656,9 +701,14 @@ impl UrmaP2pTransport {
 
         // M2: query peer catalogs over URMA SEND/RECV. Hints are
         // prioritized ahead of discovery results by `peers_with_hints`.
+        let discovery_timer = StageTimer::start(key, "peer_discovery");
         let peers = match self.peer_discovery.peers_with_hints(hints).await {
-            Ok(peers) => peers,
+            Ok(peers) => {
+                discovery_timer.finish();
+                peers
+            }
             Err(err) => {
+                drop(discovery_timer);
                 warn!(error = %err, "urma: peer discovery failed during lookup");
                 Vec::new()
             }
@@ -674,6 +724,7 @@ impl UrmaP2pTransport {
             // SEND is dropped.
             let mut last_err = None;
             for attempt in 0..3u32 {
+                info!(key, peer = %peer.node_id, attempt, "urma catalog attempt started");
                 match self.catalog.query(peer, key).await {
                     Ok(Some(descriptor)) => {
                         debug!(
@@ -685,9 +736,12 @@ impl UrmaP2pTransport {
                     }
                     Ok(None) => break, // peer confirmed absence; no point retrying
                     Err(err) => {
+                        warn!(key, peer = %peer.node_id, attempt, error = %err, "urma catalog attempt failed");
                         last_err = Some(err);
                         if attempt < 2 {
+                            let retry_timer = StageTimer::start(key, "catalog_retry_wait");
                             tokio::time::sleep(Duration::from_millis(300)).await;
+                            retry_timer.finish();
                         }
                     }
                 }
@@ -713,7 +767,11 @@ impl P2pTransport for UrmaP2pTransport {
         hints: &[P2pArtifactProviderHint],
     ) -> Result<Option<P2pArtifactDescriptor>> {
         let timer = crate::p2p::obs::OpTimer::start(URMA_BACKEND_ID, crate::p2p::obs::OP_LOOKUP);
+        let stage_timer = StageTimer::start(key, "lookup_total");
         let result = self.lookup_with_hints_inner(key, hints).await;
+        if result.is_ok() {
+            stage_timer.finish();
+        }
         if result.is_ok() {
             timer.succeed();
         }
@@ -728,7 +786,11 @@ impl P2pTransport for UrmaP2pTransport {
         _options: P2pFetchOptions,
     ) -> Result<u64> {
         let timer = crate::p2p::obs::OpTimer::start(URMA_BACKEND_ID, crate::p2p::obs::OP_FETCH);
+        let stage_timer = StageTimer::start(&descriptor.key, "fetch_file_total");
         let result = self.fetch_inner(descriptor, destination).await;
+        if result.is_ok() {
+            stage_timer.finish();
+        }
         if let Ok(size) = &result {
             timer.succeed();
             crate::p2p::obs::record_fetch_bytes(URMA_BACKEND_ID, *size);
@@ -744,7 +806,11 @@ impl P2pTransport for UrmaP2pTransport {
     ) -> Result<Bytes> {
         let timer =
             crate::p2p::obs::OpTimer::start(URMA_BACKEND_ID, crate::p2p::obs::OP_FETCH_BYTES);
+        let stage_timer = StageTimer::start(&descriptor.key, "fetch_bytes_total");
         let result = self.fetch_bytes_inner(descriptor).await;
+        if result.is_ok() {
+            stage_timer.finish();
+        }
         if let Ok(bytes) = &result {
             timer.succeed();
             crate::p2p::obs::record_fetch_bytes(URMA_BACKEND_ID, bytes.len() as u64);
@@ -773,16 +839,25 @@ impl P2pTransport for UrmaP2pTransport {
 
     #[instrument(skip(self, request), fields(key = %request.key, source = %request.source))]
     async fn publish(&self, request: &P2pPublishRequest) -> Result<()> {
+        let publish_timer = StageTimer::start(&request.key, "publish_total");
+        info!(key = %request.key, "urma publish started");
         // For file-path sources, always try mmap first: mmap returns a
         // page-aligned address, which satisfies URMA `register_seg`'s 4K
         // alignment requirement. This works for both Reference and Copy
         // modes because the source files persist in the image cache.
         if let P2pPublishSource::Path(path) = &request.source {
+            let mmap_timer = StageTimer::start(&request.key, "publish_mmap");
             match file_map::FileMap::map(path) {
                 Ok(map) => {
+                    mmap_timer.finish();
+                    info!(key = %request.key, bytes = map.len, "urma publish source mapped");
+                    let register_timer =
+                        StageTimer::start(&request.key, "publish_register_segment");
                     let locator = self
                         .registry
                         .publish(&request.key, map.addr, map.len as u64)?;
+                    register_timer.finish();
+                    let insert_timer = StageTimer::start(&request.key, "publish_local_insert");
                     self.local_artifacts.lock().unwrap().insert(
                         request.key.clone(),
                         LocalArtifact::Reference {
@@ -791,10 +866,13 @@ impl P2pTransport for UrmaP2pTransport {
                             metadata: request.metadata.clone(),
                         },
                     );
+                    insert_timer.finish();
                     self.record_published(&request.key, &locator).await;
+                    publish_timer.finish();
                     return Ok(());
                 }
                 Err(err) => {
+                    drop(mmap_timer);
                     warn!(
                         path = %path.display(),
                         error = %err,
@@ -806,6 +884,7 @@ impl P2pTransport for UrmaP2pTransport {
 
         // In-memory fallback: read the bytes (if Path) and copy them into
         // a 4K-aligned buffer so `register_seg` accepts the address.
+        let prepare_timer = StageTimer::start(&request.key, "publish_read_align_copy");
         let data = match &request.source {
             P2pPublishSource::Path(path) => tokio::fs::read(path)
                 .await
@@ -815,7 +894,12 @@ impl P2pTransport for UrmaP2pTransport {
         let buf = aligned_buf::AlignedBuf::new(&data);
         let addr = buf.addr();
         let len = buf.len() as u64;
+        prepare_timer.finish();
+        info!(key = %request.key, bytes = len, "urma publish source copied");
+        let register_timer = StageTimer::start(&request.key, "publish_register_segment");
         let locator = self.registry.publish(&request.key, addr, len)?;
+        register_timer.finish();
+        let insert_timer = StageTimer::start(&request.key, "publish_local_insert");
         self.local_artifacts.lock().unwrap().insert(
             request.key.clone(),
             LocalArtifact::InMemory {
@@ -823,7 +907,9 @@ impl P2pTransport for UrmaP2pTransport {
                 metadata: request.metadata.clone(),
             },
         );
+        insert_timer.finish();
         self.record_published(&request.key, &locator).await;
+        publish_timer.finish();
         Ok(())
     }
 
@@ -865,8 +951,11 @@ impl P2pTransport for UrmaP2pTransport {
 
 impl UrmaP2pTransport {
     async fn record_published(&self, key: &P2pArtifactKey, locator: &UrmaLocator) {
+        let timer = StageTimer::start(key, "publish_discovery_record");
         if let Err(err) = self.peer_discovery.record_key(key).await {
             warn!(error = %err, "urma: failed to record artifact in discovery");
+        } else {
+            timer.finish();
         }
         debug!(locator = %locator.encode(), "urma artifact published");
     }

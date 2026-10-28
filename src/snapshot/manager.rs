@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use anyhow::Context;
 use futures::{stream, StreamExt};
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::p2p::SnapshotP2pArtifact;
 use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
@@ -281,6 +281,7 @@ impl SnapshotManager {
         // Publish all artifacts concurrently, but don't fail if any individual artifact fails to publish.
         stream::iter(artifacts)
             .for_each_concurrent(SNAPSHOT_P2P_PUBLISH_CONCURRENCY, |artifact| async move {
+                info!(snapshot_id = %snapshot_id, key = %artifact.key, "snapshot P2P artifact publication started");
                 if let Err(error) = artifact.publish(transport).await {
                     warn!(
                         key = %artifact.key,

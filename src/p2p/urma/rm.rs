@@ -5,11 +5,11 @@
 //! remote jetty. The remote node is not involved in the data path (no
 //! remote CPU), which is the point of RM.
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::catalog::jetty_descriptor_from_address;
 use super::context::UrmaContext;
@@ -101,6 +101,7 @@ impl RmReader {
         };
 
         // 1. Import the remote jetty (cached per peer).
+        let connect_started = Instant::now();
         let conn = match self.connections.ensure_connection(&remote_jetty).await {
             Ok(conn) => conn,
             Err(err) => {
@@ -114,6 +115,8 @@ impl RmReader {
             }
         };
 
+        let connect_ms = connect_started.elapsed().as_secs_f64() * 1000.0;
+        let import_started = Instant::now();
         // 2. Import the remote segment (cached per EID/VA/key); READs
         //    address the remote memory through the imported mapping.
         let imported = match self.remote_cache.get_or_import(
@@ -134,6 +137,7 @@ impl RmReader {
                 return Err(err);
             }
         };
+        let import_ms = import_started.elapsed().as_secs_f64() * 1000.0;
         debug!(
             tjetty = conn.tjetty.0,
             remote_tseg = imported.tseg.0,
@@ -144,6 +148,10 @@ impl RmReader {
         // 3. Chunked one-sided READs. M1 uses serial chunks; a pipelined
         //    window is a follow-up once the semantics are validated on
         //    real hardware.
+        let reads_started = Instant::now();
+        let mut read_count = 0u64;
+        let mut post_ms = 0.0;
+        let mut completion_wait_ms = 0.0;
         let mut remaining = len;
         let mut remote_off = offset;
         while remaining > 0 {
@@ -159,12 +167,15 @@ impl RmReader {
                 local_va: local_base_va + (len - remaining),
                 len: chunk,
             };
+            let post_started = Instant::now();
             if let Err(err) = self.context.ops().post_read(conn.jetty, &wr) {
                 warn!(wr_id, error = %err, "urma: post_read failed");
                 self.connections.invalidate(&conn.remote_eid);
                 return Err(P2pError::internal_message("urma post_read", err));
             }
 
+            post_ms += post_started.elapsed().as_secs_f64() * 1000.0;
+            let wait_started = Instant::now();
             let completion: Completion = match tokio::time::timeout(timeout, rx).await {
                 Ok(Ok(cqe)) => cqe,
                 Ok(Err(_recv_err)) => {
@@ -182,6 +193,7 @@ impl RmReader {
                     )));
                 }
             };
+            completion_wait_ms += wait_started.elapsed().as_secs_f64() * 1000.0;
             if completion.status != 0 {
                 warn!(
                     wr_id,
@@ -194,9 +206,23 @@ impl RmReader {
                     completion.status
                 )));
             }
+            read_count += 1;
             remote_off += chunk as u64;
             remaining -= chunk as u64;
         }
+        info!(
+            stage = "read_range_breakdown",
+            remote_va = locator.va,
+            offset,
+            bytes = len,
+            connect_ms,
+            import_ms,
+            read_count,
+            post_ms,
+            completion_wait_ms,
+            reads_ms = reads_started.elapsed().as_secs_f64() * 1000.0,
+            "urma read range timing"
+        );
         conn.touch();
         Ok(())
     }

@@ -27,6 +27,8 @@ mod rm;
 #[cfg(any(test, feature = "p2p-urma"))]
 mod segment;
 #[cfg(any(test, feature = "p2p-urma"))]
+mod timing;
+#[cfg(any(test, feature = "p2p-urma"))]
 mod transport;
 
 #[cfg(any(test, feature = "p2p-urma"))]

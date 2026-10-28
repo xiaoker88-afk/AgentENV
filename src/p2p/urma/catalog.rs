@@ -34,6 +34,7 @@ use tracing::{debug, instrument, warn};
 use super::context::UrmaContext;
 use super::ctp::PeerConnectionManager;
 use super::ops::{Completion, JettyDescriptor, JettyId, MsgWr, RegisteredSeg, TargetJettyHandle};
+use super::timing::StageTimer;
 use super::URMA_BACKEND_ID;
 use crate::p2p::error::{Error, Result};
 use crate::p2p::types::{P2pArtifactDescriptor, P2pArtifactKey, P2pPeer};
@@ -280,11 +281,17 @@ impl RemoteCatalog for UrmaCatalog {
             }
         })?;
 
+        let total_timer = StageTimer::start(key, "catalog_total");
+        let connect_timer = StageTimer::start(key, "catalog_ensure_connection");
         let conn = self.connections.ensure_connection(&remote).await?;
+        connect_timer.finish();
+        let buffers_timer = StageTimer::start(key, "catalog_lease_buffers");
         let mut send_buf = self.lease().await?;
         let mut recv_buf = self.lease().await?;
+        buffers_timer.finish();
 
         let result = async {
+            let post_timer = StageTimer::start(key, "catalog_encode_post");
             let send_len = send_buf.write_json(&CatalogRequest {
                 key: key.clone(),
                 requester: jetty_descriptor_address(&conn.local_descriptor),
@@ -324,6 +331,8 @@ impl RemoteCatalog for UrmaCatalog {
                 )
                 .map_err(|e| Error::internal_message("urma post_send", e))?;
 
+            post_timer.finish();
+            let send_timer = StageTimer::start(key, "catalog_send_completion_wait");
             let send_cqe = tokio::time::timeout(self.timeout, send_rx)
                 .await
                 .map_err(|_| {
@@ -344,6 +353,8 @@ impl RemoteCatalog for UrmaCatalog {
                 )));
             }
 
+            send_timer.finish();
+            let recv_timer = StageTimer::start(key, "catalog_response_wait");
             let recv_cqe = tokio::time::timeout(self.timeout, recv_rx)
                 .await
                 .map_err(|_| {
@@ -364,6 +375,7 @@ impl RemoteCatalog for UrmaCatalog {
                 )));
             }
 
+            recv_timer.finish();
             let response = recv_buf.read_json(recv_cqe.len as usize).ok_or_else(|| {
                 Error::Internal(anyhow::anyhow!(
                     "urma: malformed catalog response ({} bytes)",
@@ -382,6 +394,9 @@ impl RemoteCatalog for UrmaCatalog {
 
         let buffers = vec![send_buf, recv_buf];
         self.release(buffers).await;
+        if result.is_ok() {
+            total_timer.finish();
+        }
         result
     }
 }
@@ -519,6 +534,7 @@ impl CatalogServer {
 
                 // 4. Answer in a dedicated task so a slow response SEND
                 // never stalls the RECV loop.
+                let scheduled = std::time::Instant::now();
                 tokio::spawn(handle_request(
                     context.clone(),
                     serve_jetty,
@@ -526,7 +542,7 @@ impl CatalogServer {
                     send_pool.clone(),
                     resolve.clone(),
                     client,
-                    request,
+                    (request, scheduled),
                 ));
             }
         })
@@ -585,8 +601,11 @@ async fn handle_request(
     send_pool: Arc<tokio::sync::Mutex<Vec<ControlBuffer>>>,
     resolve: Arc<dyn Fn(&str) -> Option<P2pArtifactDescriptor> + Send + Sync>,
     client: JettyId,
-    request: CatalogRequest,
+    request_and_scheduled: (CatalogRequest, std::time::Instant),
 ) {
+    let (request, scheduled) = request_and_scheduled;
+    tracing::info!(key = %request.key, stage = "catalog_server_spawn_wait", duration_ms = scheduled.elapsed().as_secs_f64() * 1000.0, "urma stage timing");
+    let import_timer = StageTimer::start(&request.key, "catalog_server_import_client");
     // Import the requester's jetty once per client (RM is connectionless,
     // every SEND carries its target).
     let tjetty = {
@@ -615,6 +634,8 @@ async fn handle_request(
         }
     };
 
+    import_timer.finish();
+    let buffer_timer = StageTimer::start(&request.key, "catalog_server_lease_buffer");
     // Lease a response buffer (pool grows on demand, reuses thereafter).
     let mut send_buf = {
         let mut pool = send_pool.lock().await;
@@ -630,6 +651,8 @@ async fn handle_request(
         }
     };
 
+    buffer_timer.finish();
+    let response_timer = StageTimer::start(&request.key, "catalog_server_resolve_encode_post");
     let response = CatalogResponse {
         descriptor: resolve(&request.key),
     };
@@ -657,11 +680,13 @@ async fn handle_request(
         send_pool.lock().await.push(send_buf);
         return;
     }
+    response_timer.finish();
+    let send_timer = StageTimer::start(&request.key, "catalog_server_send_completion_wait");
     // The WR references `send_buf` until its completion arrives (the
     // transport's error timeout guarantees one); only then may the buffer
     // be reused.
     match send_rx.await {
-        Ok(cqe) if cqe.status == 0 => {}
+        Ok(cqe) if cqe.status == 0 => send_timer.finish(),
         Ok(cqe) => warn!(status = cqe.status, "urma: catalog server send failed"),
         Err(_) => debug!("urma: catalog server send completion channel closed"),
     }
