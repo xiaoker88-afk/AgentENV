@@ -43,6 +43,8 @@ pub(crate) struct UrmaSettings {
     pub max_segments: usize,
     /// Bounce-window size used by the one-sided READ data path.
     pub read_chunk_bytes: u64,
+    /// Number of pre-registered one-sided READ destination buffers.
+    pub bounce_pool_size: usize,
     /// Timeout applied to dynamic remote jetty import attempts.
     pub connect_timeout: Duration,
     /// How long an idle peer connection is kept before it is torn down.
@@ -60,6 +62,7 @@ impl Default for UrmaSettings {
             max_segments: 256,
             max_imported_segments: 1024,
             read_chunk_bytes: 4 * 1024 * 1024,
+            bounce_pool_size: 16,
             connect_timeout: Duration::from_secs(10),
             idle_connection_ttl: Duration::from_secs(300),
         }
@@ -104,6 +107,7 @@ impl ResolvedP2pConfig {
                 max_segments: (p2p.urma.max_segments as usize).max(1),
                 max_imported_segments: (p2p.urma.max_imported_segments as usize).max(1),
                 read_chunk_bytes: p2p.urma.read_chunk_bytes.max(4096),
+                bounce_pool_size: (p2p.urma.bounce_pool_size as usize).max(1),
                 connect_timeout: Duration::from_millis(p2p.urma.connect_timeout_ms),
                 idle_connection_ttl: Duration::from_secs(p2p.urma.idle_connection_ttl_secs),
             },

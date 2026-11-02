@@ -708,6 +708,9 @@ pub struct P2pUrmaConfig {
     /// Bounce-window size in bytes for one-sided READ transfers.
     #[config(default = 4194304u64)]
     pub read_chunk_bytes: u64,
+    /// Number of pre-registered local buffers used by one-sided READs.
+    #[config(default = 16u64)]
+    pub bounce_pool_size: u64,
     /// Timeout in milliseconds for dynamic jetty bind attempts.
     #[config(default = 10000u64)]
     pub connect_timeout_ms: u64,

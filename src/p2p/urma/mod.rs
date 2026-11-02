@@ -13,6 +13,8 @@
 pub const URMA_BACKEND_ID: &str = "urma";
 
 #[cfg(any(test, feature = "p2p-urma"))]
+mod bounce_pool;
+#[cfg(any(test, feature = "p2p-urma"))]
 mod catalog;
 #[cfg(any(test, feature = "p2p-urma"))]
 mod context;

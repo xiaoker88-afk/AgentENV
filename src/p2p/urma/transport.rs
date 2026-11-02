@@ -22,6 +22,7 @@ use futures::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, instrument, warn, Instrument};
 
+use super::bounce_pool::BounceBufferPool;
 use super::catalog::{jetty_descriptor_address, CatalogServer, RemoteCatalog, UrmaCatalog};
 use super::context::UrmaContext;
 use super::ctp::PeerConnectionManager;
@@ -40,8 +41,6 @@ use crate::p2p::types::{
 };
 use crate::p2p::P2pByteStream;
 
-/// Upper bound on the local bounce buffer used to stage one-sided READs.
-const MAX_BOUNCE_WINDOW: u64 = 16 * 1024 * 1024;
 /// Channel capacity for streamed fetch windows.
 const STREAM_CHANNEL_CAPACITY: usize = 4;
 
@@ -260,6 +259,7 @@ pub struct UrmaP2pTransport {
     registry: Arc<SegmentRegistry>,
     remote_cache: Arc<RemoteSegmentCache>,
     reader: Arc<RmReader>,
+    bounce_pool: Arc<BounceBufferPool>,
     catalog: Arc<dyn RemoteCatalog>,
     /// Catalog server task; aborted on shutdown.
     catalog_server: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -317,6 +317,18 @@ impl UrmaP2pTransport {
             remote_cache.clone(),
             settings.read_chunk_bytes,
         ));
+        let bounce_pool_started = Instant::now();
+        let bounce_pool = BounceBufferPool::new(
+            context.clone(),
+            settings.bounce_pool_size,
+            settings.read_chunk_bytes,
+        )?;
+        info!(
+            buffers = settings.bounce_pool_size,
+            buffer_bytes = settings.read_chunk_bytes,
+            duration_ms = bounce_pool_started.elapsed().as_secs_f64() * 1000.0,
+            "urma bounce buffer pool registered"
+        );
 
         let local_endpoint = P2pEndpoint {
             backend: URMA_BACKEND_ID.to_string(),
@@ -363,6 +375,8 @@ impl UrmaP2pTransport {
         info!(
             node_id = %node_id,
             endpoint = %local_endpoint.address,
+            bounce_pool_size = settings.bounce_pool_size,
+            bounce_buffer_bytes = settings.read_chunk_bytes,
             "urma artifact transport started"
         );
 
@@ -374,6 +388,7 @@ impl UrmaP2pTransport {
             registry,
             remote_cache,
             reader,
+            bounce_pool,
             catalog,
             catalog_server: Mutex::new(Some(catalog_server)),
             local_endpoint,
@@ -448,8 +463,7 @@ impl UrmaP2pTransport {
     }
 
     /// Stream `[offset, offset+len)` of the remote segment described by
-    /// `locator` as a sequence of at-most-`MAX_BOUNCE_WINDOW` byte chunks.
-    /// The bounce buffer is registered once and reused for all windows.
+    /// `locator` as a sequence of chunks backed by a pre-registered buffer.
     fn remote_chunk_stream(
         &self,
         key: &str,
@@ -458,8 +472,8 @@ impl UrmaP2pTransport {
         len: u64,
     ) -> P2pByteStream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(STREAM_CHANNEL_CAPACITY);
-        let context = self.context.clone();
         let reader = self.reader.clone();
+        let bounce_pool = self.bounce_pool.clone();
         let fetch_timeout = self.fetch_timeout;
         let key = key.to_owned();
         let scheduled = Instant::now();
@@ -501,37 +515,19 @@ impl UrmaP2pTransport {
                     "urma data stream finished"
                 );
             };
-            let prepare_timer = StageTimer::start(&key, "bounce_allocate_register");
-            let window = len.min(MAX_BOUNCE_WINDOW);
-            // URMA requires page-aligned buffers for register_seg.
-            let layout = std::alloc::Layout::from_size_align(window as usize, 4096).unwrap();
-            let bounce_addr = unsafe { std::alloc::alloc(layout) as usize };
-            if bounce_addr == 0 {
-                record_stream("error", streamed, stream_start);
-                let _ = tx
-                    .send(Err(Error::Internal(anyhow::anyhow!(
-                        "urma: bounce alloc failed"
-                    ))))
-                    .await;
-                return;
-            }
-            unsafe { std::ptr::write_bytes(bounce_addr as *mut u8, 0, window as usize) };
-            let registered =
-                match context
-                    .ops()
-                    .register_local_seg(context.handle(), bounce_addr, window)
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        unsafe { std::alloc::dealloc(bounce_addr as *mut u8, layout) };
-                        record_stream("error", streamed, stream_start);
-                        let _ = tx
-                            .send(Err(Error::internal_message("urma register bounce", e)))
-                            .await;
-                        return;
-                    }
-                };
+            let prepare_timer = StageTimer::start(&key, "bounce_pool_lease");
+            let lease = match bounce_pool.lease().await {
+                Ok(lease) => lease,
+                Err(err) => {
+                    record_stream("error", streamed, stream_start);
+                    let _ = tx.send(Err(err)).await;
+                    return;
+                }
+            };
             prepare_timer.finish();
+            let window = len.min(bounce_pool.buffer_len());
+            let bounce_addr = lease.addr();
+            let registered = lease.registered();
             let mut remaining = len;
             let mut pos = offset;
             while remaining > 0 {
@@ -599,9 +595,8 @@ impl UrmaP2pTransport {
             if status == "ok" {
                 record_stream(status, streamed, stream_start);
             }
-            let cleanup_timer = StageTimer::start(&key, "bounce_unregister_free");
-            let _ = context.ops().unregister_seg(registered.tseg);
-            unsafe { std::alloc::dealloc(bounce_addr as *mut u8, layout) };
+            let cleanup_timer = StageTimer::start(&key, "bounce_pool_release");
+            drop(lease);
             cleanup_timer.finish();
             if status == "ok" {
                 stream_timer.finish();
@@ -667,7 +662,8 @@ impl UrmaP2pTransport {
 
         let locator = self.locator_from_descriptor(descriptor)?;
         let total_len = locator.len;
-        let mut collected = Vec::with_capacity(total_len.min(MAX_BOUNCE_WINDOW) as usize);
+        let mut collected =
+            Vec::with_capacity(total_len.min(self.bounce_pool.buffer_len()) as usize);
         let mut stream = self.remote_chunk_stream(&descriptor.key, locator, 0, total_len);
         while let Some(chunk) = stream.next().await {
             collected.extend_from_slice(&chunk?);
@@ -933,6 +929,7 @@ impl P2pTransport for UrmaP2pTransport {
         }
         self.connections.shutdown();
         self.remote_cache.clear(&self.context);
+        self.bounce_pool.shutdown();
         let keys: Vec<String> = self
             .local_artifacts
             .lock()
@@ -1076,6 +1073,40 @@ mod tests {
         assert_eq!(status.reads_log.len(), 2);
         assert_eq!(status.reads_log[1].remote_va, 0x2000 + 10);
         assert_eq!(status.reads_log[1].len, 20);
+    }
+
+    #[tokio::test]
+    async fn remote_fetch_reuses_pre_registered_bounce_buffers() {
+        let ops = MockUrmaOps::new();
+        let mut config = test_config();
+        config.transport = crate::p2p::config::P2pTransportKind::Urma;
+        config.urma.bounce_pool_size = 2;
+        let transport = UrmaP2pTransport::with_ops(
+            ops.clone(),
+            &config,
+            "node-a".to_string(),
+            Arc::new(crate::p2p::discovery::NoopP2pPeerDiscovery),
+        )
+        .unwrap();
+
+        // Let the catalog server finish registering its own receive pool,
+        // then use the resulting count as the stable transport baseline.
+        tokio::task::yield_now().await;
+        let registered_at_start = ops.status.lock().unwrap().registered.len();
+        assert!(registered_at_start >= 2);
+        transport
+            .fetch_bytes(&remote_descriptor(100))
+            .await
+            .unwrap();
+        transport
+            .fetch_bytes(&remote_descriptor(200))
+            .await
+            .unwrap();
+
+        let status = ops.status.lock().unwrap();
+        assert_eq!(status.registered.len(), registered_at_start);
+        assert_eq!(status.unregistered, 0);
+        assert_eq!(status.reads_log.len(), 2);
     }
 
     #[tokio::test]

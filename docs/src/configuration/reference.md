@@ -379,12 +379,29 @@ snapshot publication/runtime resolution as an optional acceleration path.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | Enable the P2P artifact transport. When false, AgentENV uses `DisabledP2pTransport`, so lookups miss and publishes are no-ops. |
-| `transport` | string | `"iroh"` | Transport backend. Supported values are `"disabled"` and `"iroh"`. Ignored while `enabled = false`. |
+| `transport` | string | `"iroh"` | Transport backend. Supported values are `"disabled"`, `"iroh"`, `"urma"`, and `"composite"`. Ignored while `enabled = false`. |
 | `store_dir` | string | `"$AENV_HOME/p2p/store"` | Local store used by the transport backend. Relative explicit paths are resolved against the config file directory. |
 | `listen_addr` | string | `"0.0.0.0:0"` | Optional local listen address for the embedded transport endpoint. Port `0` lets the OS choose a free port. |
 | `lookup_timeout_ms` | integer | `5000` | Timeout for one artifact catalog lookup against a peer. |
 | `fetch_timeout_ms` | integer | `30000` | Timeout for fetching one artifact from a peer. |
 | `peer_discovery_refresh_interval_secs` | integer | `5` | Interval for refreshing peer endpoints from scheduler. Values below one second are clamped to one second. |
+
+### `[p2p.urma]`
+
+Settings used when the URMA transport is enabled.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `device` | string | `""` | UB device name. An empty value selects the first available device. |
+| `jfs_count` | integer | `8` | Send jetty queue depth requested from URMA. |
+| `jfr_count` | integer | `4` | Receive jetty queue depth requested from URMA. |
+| `max_segments` | integer | `256` | Maximum number of registered published Artifact segments. |
+| `read_chunk_bytes` | integer | `4194304` | Size of each pre-registered READ destination buffer and maximum bytes transferred by one READ window. |
+| `bounce_pool_size` | integer | `16` | Number of READ destination buffers registered when the transport starts. A fetch waits when all buffers are in use. Registered memory is approximately `read_chunk_bytes * bounce_pool_size`. |
+| `connect_timeout_ms` | integer | `10000` | Timeout for importing a remote jetty. |
+| `idle_connection_ttl_secs` | integer | `300` | Time an idle peer connection remains cached. |
+| `max_imported_segments` | integer | `1024` | Maximum number of imported remote segments retained in the LRU cache. |
+| `static_peers` | array of strings | `[]` | Static peer endpoints used when scheduler discovery is unavailable. |
 
 ## `[custom_extension]`
 
