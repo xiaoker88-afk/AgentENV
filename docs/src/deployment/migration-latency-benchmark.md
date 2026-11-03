@@ -422,6 +422,49 @@ echo $?
 
 `0` 表示全部迁移成功；非零表示服务检查、创建、迁移或日志采集失败。脚本不会自动删除测试沙箱：成功的沙箱保留在 node-b，失败后应根据 `run-info.json` 检查沙箱实际所在节点。
 
+#### 迁移后读取并校验内存和磁盘字节
+
+第一轮建议先用一个沙箱和较小数据量验证完整链路：
+
+```bash
+export AENV_API_KEY='实际 API Key'
+
+python3 scripts/run-migration-test.py \
+  --concurrency 1 \
+  --image 141.61.17.188:5000/agentenv-lab/sandbox-small:v1 \
+  --target-node node-b \
+  --transport urma \
+  --sandbox-memory-mb 2048 \
+  --memory-workload-mib 64 \
+  --disk-workload-mib 64
+```
+
+新增参数的含义：
+
+| 参数 | 含义 |
+|---|---|
+| `--memory-workload-mib 64` | 迁移前向每个沙箱的 `/dev/shm` 写入 64 MiB 随机数据；它用于验证 guest 内存快照恢复后的读取 |
+| `--disk-workload-mib 64` | 迁移前向 rootfs 可写层写入 64 MiB 随机数据；它用于验证迁移后磁盘读取 |
+| `--sandbox-memory-mb 2048` | 每个沙箱分配 2048 MiB 内存，必须明显大于内存 workload |
+| `--sandbox-disk-mb 65536` | 每个沙箱的虚拟磁盘容量，默认已经是 65536 MiB |
+| `--aenv-binary` | `aenv` CLI 的路径；命令不在 `PATH` 时可写 `/opt/agentenv/bin/aenv` |
+
+脚本的实际顺序是：创建沙箱、等待 Gateway 识别源节点、写入随机数据并记录 SHA-256、并发迁移、在目标节点通过 Gateway 执行 `sha256sum`。`sha256sum` 必须完整读取文件，因此它同时承担“触发迁移后读取”和“确认字节没有损坏”两项工作。
+
+成功时终端最后出现：
+
+```text
+SUCCESS: all 1 sandboxes migrated to node-b
+```
+
+本轮目录的 `run-info.json` 还会增加：
+
+- `workload_preparation`：迁移前每个文件的路径、大小和原始 SHA-256；
+- `post_migration_reads`：迁移后读取耗时、实际 SHA-256、是否一致及按端到端命令耗时计算的吞吐；
+- `post_migration_read_batch_duration_ms`：所有沙箱完成迁移后读校验的整批墙钟时间。
+
+`migration-summary.log` 的 `POST-MIGRATION BYTE READS` 表也会列出每个沙箱的内存、磁盘读取结果。这里的 `duration_ms` 包含 `aenv exec` 控制面开销和 `sha256sum` 计算时间，适合先判断链路是否打通；它还不是纯 P2P 网络带宽。
+
 如果在非 root 用户下运行，本机日志采集要求无交互的 `sudo` 权限；node-b 日志采集要求 SSH 用户可以直接执行 `journalctl`。完整日志可能包含运行环境信息，复制到其他环境前应自行检查。
 
 #### 压缩单轮日志供离线分析

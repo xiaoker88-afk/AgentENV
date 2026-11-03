@@ -360,6 +360,31 @@ class HttpTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_workload_is_written_and_verified_by_checksum(self):
+        outputs = {
+            "/dev/shm/aenv-migration-memory.bin": "a" * 64,
+            "/opt/agentenv-test/aenv-migration-disk.bin": "b" * 64,
+        }
+
+        def execute(_binary, _gateway, _sandbox, command, **_kwargs):
+            path = next(path for path in outputs if path in command)
+            return {
+                "ok": True,
+                "exit_code": 0,
+                "duration_ms": 20,
+                "stdout": f"{outputs[path]}  {path}\n",
+                "stderr": "",
+            }
+
+        with mock.patch.object(bench, "sandbox_exec", side_effect=execute):
+            prepared = bench.prepare_workload("aenv", "http://gateway", "s1", 4, 8)
+            verified = bench.verify_workload("aenv", "http://gateway", "s1", prepared)
+        self.assertTrue(prepared["ok"])
+        self.assertTrue(verified["ok"])
+        self.assertEqual(prepared["artifacts"]["memory"]["size_bytes"], 4 * 1024 * 1024)
+        self.assertEqual(verified["artifacts"]["disk"]["throughput_mib_s"], 400.0)
+        self.assertTrue(verified["artifacts"]["memory"]["checksum_matches"])
+
     def test_default_topology_runs_on_a_and_only_uses_ssh_for_b(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             sys, "argv", [str(SCRIPT)]

@@ -78,6 +78,35 @@ def parse_args() -> argparse.Namespace:
         choices=("urma", "iroh", "composite", "disabled", "unknown"),
         default=os.environ.get("AENV_BENCH_TRANSPORT"),
     )
+    parser.add_argument(
+        "--memory-workload-mib",
+        type=int,
+        default=0,
+        help="random MiB written to /dev/shm and verified after migration",
+    )
+    parser.add_argument(
+        "--disk-workload-mib",
+        type=int,
+        default=0,
+        help="random MiB written to the rootfs and verified after migration",
+    )
+    parser.add_argument(
+        "--sandbox-memory-mb",
+        type=int,
+        default=512,
+        help="guest memory for each created sandbox (default: 512)",
+    )
+    parser.add_argument(
+        "--sandbox-disk-mb",
+        type=int,
+        default=65536,
+        help="guest disk size for each created sandbox (default: 65536)",
+    )
+    parser.add_argument(
+        "--aenv-binary",
+        default=env("AENV_BENCH_AENV_BINARY", "aenv"),
+        help="aenv CLI used to execute workload commands inside sandboxes",
+    )
     return parser.parse_args()
 
 
@@ -197,7 +226,13 @@ def http_request(
     }
 
 
-def create_sandbox(source_runtime: str, api_key: str, image: str) -> dict:
+def create_sandbox(
+    source_runtime: str,
+    api_key: str,
+    image: str,
+    memory_mb: int = 512,
+    disk_mb: int = 65536,
+) -> dict:
     result = http_request(
         "POST",
         f"{source_runtime.rstrip('/')}/sandboxes-cold",
@@ -206,8 +241,8 @@ def create_sandbox(source_runtime: str, api_key: str, image: str) -> dict:
             "image": image,
             "timeout": 3600,
             "cpuCount": 1,
-            "memoryMB": 512,
-            "diskSizeMB": 65536,
+            "memoryMB": memory_mb,
+            "diskSizeMB": disk_mb,
             "secure": False,
         },
         timeout=600,
@@ -222,6 +257,123 @@ def create_sandbox(source_runtime: str, api_key: str, image: str) -> dict:
             result["ok"] = False
             result["parse_error"] = f"invalid create response: {error}"
     return result
+
+
+SHA256 = re.compile(r"(?m)^([0-9a-fA-F]{64})\s+")
+WORKLOAD_PATHS = {
+    "memory": "/dev/shm/aenv-migration-memory.bin",
+    "disk": "/opt/agentenv-test/aenv-migration-disk.bin",
+}
+
+
+def sandbox_exec(
+    aenv_binary: str,
+    gateway: str,
+    sandbox_id: str,
+    command: str,
+    *,
+    timeout: int = 600,
+) -> dict:
+    environment = os.environ.copy()
+    environment["AENV_SERVER_URL"] = gateway
+    started_ns = time.monotonic_ns()
+    try:
+        result = subprocess.run(
+            [aenv_binary, "exec", sandbox_id, "--", "sh", "-lc", command],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=environment,
+        )
+        return {
+            "ok": result.returncode == 0,
+            "exit_code": result.returncode,
+            "duration_ms": round((time.monotonic_ns() - started_ns) / 1_000_000, 3),
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+    except subprocess.TimeoutExpired as error:
+        return {
+            "ok": False,
+            "exit_code": None,
+            "duration_ms": round((time.monotonic_ns() - started_ns) / 1_000_000, 3),
+            "stdout": error.stdout or "",
+            "stderr": error.stderr or f"command timed out after {timeout}s",
+        }
+
+
+def extract_sha256(result: dict) -> str | None:
+    match = SHA256.search(result.get("stdout", ""))
+    return match.group(1).lower() if match else None
+
+
+def prepare_workload(
+    aenv_binary: str,
+    gateway: str,
+    sandbox_id: str,
+    memory_mib: int,
+    disk_mib: int,
+) -> dict:
+    prepared = {"sandbox_id": sandbox_id, "ok": True, "artifacts": {}}
+    for kind, size_mib in (("memory", memory_mib), ("disk", disk_mib)):
+        if size_mib == 0:
+            continue
+        path = WORKLOAD_PATHS[kind]
+        parent = str(pathlib.PurePosixPath(path).parent)
+        command = (
+            f"set -eu; mkdir -p {shlex.quote(parent)}; "
+            f"dd if=/dev/urandom of={shlex.quote(path)} bs=1048576 count={size_mib} 2>/dev/null; "
+            f"sync; sha256sum {shlex.quote(path)}"
+        )
+        result = sandbox_exec(aenv_binary, gateway, sandbox_id, command)
+        checksum = extract_sha256(result)
+        artifact = {
+            "path": path,
+            "size_bytes": size_mib * 1024 * 1024,
+            "sha256": checksum,
+            **result,
+        }
+        prepared["artifacts"][kind] = artifact
+        if not result["ok"] or checksum is None:
+            prepared["ok"] = False
+    return prepared
+
+
+def verify_workload(
+    aenv_binary: str,
+    gateway: str,
+    sandbox_id: str,
+    expected: dict,
+) -> dict:
+    verified = {"sandbox_id": sandbox_id, "ok": True, "artifacts": {}}
+    for kind, before in expected.get("artifacts", {}).items():
+        result = sandbox_exec(
+            aenv_binary,
+            gateway,
+            sandbox_id,
+            f"sha256sum {shlex.quote(before['path'])}",
+        )
+        actual = extract_sha256(result)
+        matches = actual is not None and actual == before.get("sha256")
+        duration_ms = result["duration_ms"]
+        artifact = {
+            "path": before["path"],
+            "size_bytes": before["size_bytes"],
+            "expected_sha256": before.get("sha256"),
+            "actual_sha256": actual,
+            "checksum_matches": matches,
+            "throughput_mib_s": round(
+                before["size_bytes"] / (1024 * 1024) / (duration_ms / 1000), 3
+            )
+            if duration_ms > 0
+            else None,
+            **result,
+        }
+        verified["artifacts"][kind] = artifact
+        if not result["ok"] or not matches:
+            verified["ok"] = False
+    return verified
 
 
 def wait_for_gateway_bindings(
@@ -603,8 +755,10 @@ def summarize_run(
         "gateway",
         "target_node",
         "sandbox_resources",
+        "workload",
         "creation_batch_duration_ms",
         "migration_batch_duration_ms",
+        "post_migration_read_batch_duration_ms",
         "journal_scope",
         "hosts",
         "errors",
@@ -677,6 +831,21 @@ def summarize_run(
         )
         if not result.get("ok"):
             lines.append(f"  response={str(result.get('response', ''))[:700]}")
+    if run_info.get("post_migration_reads"):
+        lines += [
+            "",
+            "POST-MIGRATION BYTE READS",
+            "sandbox kind bytes duration_ms throughput_mib_s checksum_matches",
+        ]
+        for result in sorted(
+            run_info["post_migration_reads"], key=lambda item: item["sandbox_id"]
+        ):
+            for kind, artifact in sorted(result.get("artifacts", {}).items()):
+                lines.append(
+                    f"{result['sandbox_id']} {kind} {artifact['size_bytes']} "
+                    f"{artifact['duration_ms']} {artifact.get('throughput_mib_s', '-')} "
+                    f"{artifact.get('checksum_matches', False)}"
+                )
     urma_rows = stage_statistics(timings)
     table("URMA STAGES", urma_rows)
     lines += [
@@ -753,6 +922,12 @@ def main() -> int:
             args.image = input("完整镜像地址: ").strip()
     if args.concurrency < 1 or not args.image:
         raise TestFailure("concurrency must be >= 1 and image must not be empty")
+    if args.memory_workload_mib < 0 or args.disk_workload_mib < 0:
+        raise TestFailure("workload sizes must be >= 0")
+    if args.sandbox_memory_mb < 1 or args.sandbox_disk_mb < 1:
+        raise TestFailure("sandbox memory and disk sizes must be >= 1")
+    if args.memory_workload_mib >= args.sandbox_memory_mb:
+        raise TestFailure("memory workload must be smaller than sandbox memory")
     api_key = os.environ.get("AENV_API_KEY", "")
     if not api_key:
         raise TestFailure("AENV_API_KEY is required in the environment")
@@ -780,13 +955,22 @@ def main() -> int:
         "transport": args.transport,
         "sandbox_resources": {
             "cpu_count": 1,
-            "memory_mb": 512,
-            "disk_size_mb": 65536,
+            "memory_mb": args.sandbox_memory_mb,
+            "disk_size_mb": args.sandbox_disk_mb,
             "timeout_seconds": 3600,
             "secure": False,
         },
+        "workload": {
+            "memory_mib": args.memory_workload_mib,
+            "disk_mib": args.disk_workload_mib,
+            "memory_path": WORKLOAD_PATHS["memory"],
+            "disk_path": WORKLOAD_PATHS["disk"],
+            "read_operation": "sha256sum",
+        },
         "creations": [],
+        "workload_preparation": [],
         "migrations": [],
+        "post_migration_reads": [],
         "errors": [],
         "journal_scope": "preparation",
     }
@@ -800,7 +984,13 @@ def main() -> int:
         creation_started = time.monotonic()
         for index in range(args.concurrency):
             print(f"[create {index + 1}/{args.concurrency}] {args.image}", flush=True)
-            creation = create_sandbox(args.source_runtime, api_key, args.image)
+            creation = create_sandbox(
+                args.source_runtime,
+                api_key,
+                args.image,
+                args.sandbox_memory_mb,
+                args.sandbox_disk_mb,
+            )
             creation["index"] = index + 1
             run_info["creations"].append(creation)
             write_run_info(run_info_path, run_info)
@@ -812,10 +1002,37 @@ def main() -> int:
         sandbox_ids = [creation["sandbox_id"] for creation in run_info["creations"]]
         print("[prepare] waiting for Gateway/Scheduler bindings", flush=True)
         wait_for_gateway_bindings(args.gateway, api_key, sandbox_ids)
+        if args.memory_workload_mib or args.disk_workload_mib:
+            print(
+                f"[prepare] writing memory={args.memory_workload_mib} MiB "
+                f"disk={args.disk_workload_mib} MiB in {len(sandbox_ids)} sandboxes",
+                flush=True,
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+                futures = [
+                    executor.submit(
+                        prepare_workload,
+                        args.aenv_binary,
+                        args.gateway,
+                        sandbox_id,
+                        args.memory_workload_mib,
+                        args.disk_workload_mib,
+                    )
+                    for sandbox_id in sandbox_ids
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    run_info["workload_preparation"].append(future.result())
+                    write_run_info(run_info_path, run_info)
+            run_info["workload_preparation"].sort(key=lambda result: result["sandbox_id"])
+            failed = [result for result in run_info["workload_preparation"] if not result["ok"]]
+            if failed:
+                raise TestFailure(
+                    f"workload preparation failed in {len(failed)} of {len(sandbox_ids)} sandboxes"
+                )
         # Exclude image creation and its URMA traffic from migration statistics.
         for label, (target, unit) in hosts.items():
             cursors[label] = journal_cursor(target, unit, label)
-        run_info["journal_scope"] = "migration plus 1s drain"
+        run_info["journal_scope"] = "migration, post-migration reads, plus 1s drain"
         print(f"[migrate] submitting {len(sandbox_ids)} concurrent migrations", flush=True)
         migration_started = time.monotonic()
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
@@ -837,6 +1054,36 @@ def main() -> int:
             raise TestFailure(
                 f"{len(failed)} of {len(sandbox_ids)} migrations failed; see per-sandbox results"
             )
+        if run_info["workload_preparation"]:
+            print("[verify] reading and checksumming migrated bytes", flush=True)
+            expected = {
+                result["sandbox_id"]: result for result in run_info["workload_preparation"]
+            }
+            verify_started = time.monotonic()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+                futures = [
+                    executor.submit(
+                        verify_workload,
+                        args.aenv_binary,
+                        args.gateway,
+                        sandbox_id,
+                        expected[sandbox_id],
+                    )
+                    for sandbox_id in sandbox_ids
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    run_info["post_migration_reads"].append(future.result())
+                    write_run_info(run_info_path, run_info)
+            run_info["post_migration_reads"].sort(key=lambda result: result["sandbox_id"])
+            run_info["post_migration_read_batch_duration_ms"] = round(
+                (time.monotonic() - verify_started) * 1000, 3
+            )
+            failed = [result for result in run_info["post_migration_reads"] if not result["ok"]]
+            if failed:
+                raise TestFailure(
+                    f"post-migration byte verification failed in {len(failed)} of "
+                    f"{len(sandbox_ids)} sandboxes"
+                )
         run_info["status"] = "succeeded"
     except KeyboardInterrupt:
         exit_code = 130
