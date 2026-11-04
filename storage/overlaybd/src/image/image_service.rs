@@ -10,6 +10,7 @@ use crate::backend::cache::{
 };
 use crate::backend::local::LocalFile;
 use crate::backend::oss::OssBackend;
+use crate::backend::p2p_fallback::{P2pFallbackFile, P2pRangeFile};
 use crate::backend::registryfs_v2::RegistryFsV2;
 use crate::config::{
     load_global_config, resolve_image_config_local_paths, validate_image_config, DownloadConfig,
@@ -373,11 +374,13 @@ impl ImageService {
     ) -> Result<Arc<dyn VirtualFile>> {
         let remote_runtime = self.remote_runtime().await?;
         let source = self.open_backend_source_with_size(url, source_size).await?;
-        // OSS blobs always go through the file cache (when available) regardless
-        // of RemoteOpenMode. RemoteOpenMode::Direct is only meaningful for the
-        // P2P accelerator path, which acts as its own cache; OSS has no P2P
-        // channel, so we always want the local file cache as a read-ahead layer.
+        // OSS blobs always go through the file cache (when available). On a
+        // cache miss, managed digest-addressed layers try P2P first and fall
+        // back to OSS; bytes from either source populate the same cache entry.
         if Self::is_oss_url(url) {
+            let source = self
+                .wrap_oss_source_with_p2p(url, source_size, source)
+                .await?;
             if let Some(cache) = remote_runtime.file_cache.as_ref() {
                 let cache_file = Self::open_cached_blob(cache, url, source, source_size).await?;
                 return Ok(cache_file);
@@ -572,6 +575,50 @@ impl ImageService {
             Ok(parsed) => matches!(parsed.scheme(), "s3" | "oss"),
             Err(_) => false,
         }
+    }
+
+    fn p2p_digest_url(&self, digest: &str) -> Option<String> {
+        let p2p = &self.inner.global_config.p2p_config;
+        if !p2p.enable {
+            return None;
+        }
+        let base = p2p.address.trim_end_matches('/').strip_suffix("/p2p-http")?;
+        Some(format!("{base}/p2p-digest/{digest}"))
+    }
+
+    fn digest_from_blob_url(url: &str) -> Option<String> {
+        let parsed = reqwest::Url::parse(url).ok()?;
+        let digest = parsed.path_segments()?.next_back()?;
+        let hex = digest.strip_prefix("sha256:")?;
+        if hex.len() != 64 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(format!("sha256:{}", hex.to_ascii_lowercase()))
+    }
+
+    async fn wrap_oss_source_with_p2p(
+        &self,
+        url: &str,
+        source_size: Option<u64>,
+        oss_source: Arc<dyn VirtualFile>,
+    ) -> Result<Arc<dyn VirtualFile>> {
+        let Some(digest) = Self::digest_from_blob_url(url) else {
+            return Ok(oss_source);
+        };
+        let Some(p2p_url) = self.p2p_digest_url(&digest) else {
+            return Ok(oss_source);
+        };
+        let size = match source_size {
+            Some(size) => size,
+            None => oss_source.size().await?,
+        };
+        let p2p_source: Arc<dyn VirtualFile> = Arc::new(P2pRangeFile::new(p2p_url, size));
+        Ok(Arc::new(P2pFallbackFile::new(
+            p2p_source,
+            oss_source,
+            digest,
+            size,
+        )))
     }
 
     async fn open_backend_source_with_size(
@@ -1330,6 +1377,32 @@ mod tests {
         assert_eq!(
             service.p2p_uuid_address().as_deref(),
             Some("http://127.0.0.1:9731/p2p-uuid")
+        );
+        assert_eq!(
+            service
+                .p2p_digest_url(
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                )
+                .as_deref(),
+            Some(
+                "http://127.0.0.1:9731/p2p-digest/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )
+        );
+    }
+
+    #[test]
+    fn digest_from_oss_blob_url_accepts_only_sha256_layer_keys() {
+        let digest = "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        assert_eq!(
+            ImageService::digest_from_blob_url(&format!(
+                "s3://bucket/prefix/managed-layers/{digest}"
+            ))
+            .as_deref(),
+            Some(digest)
+        );
+        assert_eq!(
+            ImageService::digest_from_blob_url("s3://bucket/prefix/managed-layers/not-a-digest"),
+            None
         );
     }
 

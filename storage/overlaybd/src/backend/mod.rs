@@ -1,6 +1,8 @@
 pub mod cache;
 pub mod local;
 #[cfg(feature = "full")]
+pub mod p2p_fallback;
+#[cfg(feature = "full")]
 pub mod oss;
 #[cfg(feature = "full")]
 pub mod registryfs_v2;

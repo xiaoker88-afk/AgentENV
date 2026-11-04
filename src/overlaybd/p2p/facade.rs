@@ -35,6 +35,7 @@ const DEFAULT_DESCRIPTOR_CACHE_MAX_ENTRIES: usize = 16 * 1024;
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const ADDRESS_PREFIX: &str = "/p2p-http";
 const UUID_ADDRESS_PREFIX: &str = "/p2p-uuid";
+const DIGEST_ADDRESS_PREFIX: &str = "/p2p-digest";
 const PUBLISH_LAYER_PATH: &str = "/p2p-control/publish-layer";
 
 #[derive(Debug, Clone)]
@@ -176,6 +177,10 @@ impl P2pHttpFacadeServer {
                 &format!("{UUID_ADDRESS_PREFIX}/{{uuid}}"),
                 get(handle_uuid_facade),
             )
+            .route(
+                &format!("{DIGEST_ADDRESS_PREFIX}/{{digest}}"),
+                get(handle_digest_facade),
+            )
             .route(PUBLISH_LAYER_PATH, post(handle_publish_layer))
             .with_state(state);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -238,6 +243,17 @@ async fn handle_uuid_facade(
     request: Request,
 ) -> Response<Body> {
     match handle_uuid_facade_result(state, uuid, request).await {
+        Ok(response) => response,
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn handle_digest_facade(
+    State(state): State<P2pHttpFacadeState>,
+    axum::extract::Path(digest): axum::extract::Path<String>,
+    request: Request,
+) -> Response<Body> {
+    match handle_digest_facade_result(state, digest, request).await {
         Ok(response) => response,
         Err(err) => err.into_response(),
     }
@@ -329,6 +345,46 @@ async fn handle_uuid_facade_result(
             HttpFacadeError::new(
                 StatusCode::BAD_GATEWAY,
                 "failed to fetch p2p uuid layer range",
+            )
+        })?;
+    build_range_body_response(
+        &request_range,
+        range_body.response_len,
+        range_body.total_size,
+        range_body.body,
+    )
+}
+
+async fn handle_digest_facade_result(
+    state: P2pHttpFacadeState,
+    digest: String,
+    request: Request,
+) -> std::result::Result<Response<Body>, HttpFacadeError> {
+    reject_conditional_headers(request.headers())?;
+    validate_digest(&digest)?;
+    let request_range = parse_single_range(request.headers())?;
+    let len = request_range.len()?;
+    let canonical = CanonicalBlobIdentity::from_digest(&digest);
+    let artifact_key = layer_artifact_key(&canonical);
+    let Some(descriptor) = lookup_descriptor(&state, &artifact_key, &canonical).await else {
+        return Err(HttpFacadeError::new(
+            StatusCode::NOT_FOUND,
+            format!("p2p digest layer {digest} was not found"),
+        ));
+    };
+
+    let range_body = fetch_p2p_range(&state, &descriptor, &canonical, &request_range, len)
+        .await
+        .map_err(|err| {
+            warn!(
+                key = %artifact_key,
+                digest = %digest,
+                error = ?err,
+                "p2p digest layer range fetch failed"
+            );
+            HttpFacadeError::new(
+                StatusCode::BAD_GATEWAY,
+                "failed to fetch p2p digest layer range",
             )
         })?;
     build_range_body_response(
@@ -1064,6 +1120,57 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(resp.bytes().await.unwrap().as_ref(), &blob[100..200]);
         assert_eq!(transport.fetch_range_count.load(Ordering::Relaxed), 1);
+        facade.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn p2p_digest_hit_returns_exact_range_without_origin() {
+        let blob: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let digest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let canonical = CanonicalBlobIdentity::from_digest(digest);
+        let key = layer_artifact_key(&canonical);
+        let transport = Arc::new(MockTransport::default());
+        transport.descriptors.write().await.insert(
+            key.clone(),
+            layer_descriptor(key.clone(), digest, blob.len() as u64),
+        );
+        transport
+            .blobs
+            .write()
+            .await
+            .insert(key, Bytes::from(blob.clone()));
+
+        let facade = start_test_facade(transport.clone(), Vec::new()).await;
+        let digest_address = facade.address().trim_end_matches("/p2p-http");
+        let resp = get_range(
+            &format!("{digest_address}/p2p-digest/{digest}"),
+            100,
+            199,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), &blob[100..200]);
+        assert_eq!(transport.fetch_range_count.load(Ordering::Relaxed), 1);
+        facade.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn p2p_digest_miss_returns_not_found() {
+        let digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let transport = Arc::new(MockTransport::default());
+        let facade = start_test_facade(transport.clone(), Vec::new()).await;
+        let digest_address = facade.address().trim_end_matches("/p2p-http");
+
+        let resp = get_range(
+            &format!("{digest_address}/p2p-digest/{digest}"),
+            0,
+            63,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(transport.fetch_range_count.load(Ordering::Relaxed), 0);
         facade.shutdown().await.unwrap();
     }
 
