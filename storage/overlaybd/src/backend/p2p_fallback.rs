@@ -93,7 +93,7 @@ impl VirtualFile for P2pFallbackFile {
         let started = Instant::now();
         match self.p2p.read_at(offset, len).await {
             Ok(bytes) => {
-                tracing::debug!(
+                tracing::info!(
                     digest = %self.digest,
                     offset,
                     bytes = bytes.len(),
@@ -105,7 +105,7 @@ impl VirtualFile for P2pFallbackFile {
                 Ok(bytes)
             }
             Err(error) => {
-                tracing::debug!(
+                tracing::info!(
                     digest = %self.digest,
                     offset,
                     bytes = len,
@@ -115,7 +115,7 @@ impl VirtualFile for P2pFallbackFile {
                 );
                 let fallback_started = Instant::now();
                 let result = self.fallback.read_at(offset, len).await;
-                tracing::debug!(
+                tracing::info!(
                     digest = %self.digest,
                     offset,
                     bytes = result.as_ref().map_or(0, Bytes::len),

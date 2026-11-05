@@ -244,6 +244,23 @@ class ReportTests(unittest.TestCase):
         self.assertIn("HTTP=not-recorded", text)
         self.assertIn("missing_migration_total=never-migrated", text)
 
+    def test_overlaybd_daemon_reads_are_summarized_by_path_and_source(self):
+        self.log("gateway", marker())
+        self.log(
+            "node-b-ublk",
+            'INFO overlaybd layer range read digest="sha256:abc" offset=0 bytes=262144 duration_ms=2.5 source="p2p" read_path="background_download"',
+            'INFO overlaybd P2P layer range failed; falling back to OSS digest="sha256:def" offset=0 bytes=65536 read_path="on_demand" error="not found"',
+            'INFO overlaybd layer range read digest="sha256:def" offset=0 bytes=65536 duration_ms=4 source="oss" read_path="on_demand" status="ok"',
+        )
+
+        text = bench.summarize_run(self.root).read_text()
+
+        self.assertIn("OVERLAYBD LAYER READS", text)
+        self.assertIn("node-b background_download p2p ok 1 262144 2.500 100.000", text)
+        self.assertIn("node-b on_demand oss ok 1 65536 4.000 15.625", text)
+        self.assertIn("node-b on_demand 1 65536", text)
+        self.assertIn("overlaybd_reads=2", text)
+
     def test_collection_streams_full_journal_and_reports_command_failure(self):
         path = self.root / "logs" / "node-b.log"
 
@@ -260,6 +277,23 @@ class ReportTests(unittest.TestCase):
                 bench.collect_journal("root@b", "agentenv", "cursor", path), "journal error"
             )
         self.assertIn("some log", path.read_text())
+
+    def test_collect_file_since_streams_only_new_bytes(self):
+        path = self.root / "logs" / "node-b-ublk.log"
+        completed = [
+            subprocess.CompletedProcess(["stat"], 0, stdout="20\n", stderr=""),
+            subprocess.CompletedProcess(["tail"], 0, stdout="", stderr=""),
+        ]
+
+        def run(command, **kwargs):
+            result = completed.pop(0)
+            if kwargs.get("stdout") is not None:
+                kwargs["stdout"].write("new daemon log\n")
+            return result
+
+        with mock.patch.object(bench.subprocess, "run", side_effect=run):
+            self.assertIsNone(bench.collect_file_since("root@b", "/tmp/ublk.log", 10, path))
+        self.assertEqual(path.read_text(), "new daemon log\n")
 
     def test_legacy_script_invocation_and_offline_mode(self):
         self.log("gateway", marker())
@@ -452,6 +486,12 @@ class RunnerTests(unittest.TestCase):
                     )
                     return None
 
+                def collect_ublk(target, path, offset, destination):
+                    self.assertEqual(path, "/var/lib/aenv/logs/ublk-daemon.log")
+                    self.assertEqual(offset, 8)
+                    destination.write_text("")
+                    return None
+
                 with mock.patch.object(bench, "parse_args", return_value=args), mock.patch.dict(
                     os.environ, {"AENV_API_KEY": "do-not-persist-this"}
                 ), mock.patch.object(bench, "ensure_service_active"), mock.patch.object(
@@ -465,6 +505,10 @@ class RunnerTests(unittest.TestCase):
                 ), mock.patch.object(
                     bench, "collect_journal", side_effect=collect
                 ) as collector, mock.patch.object(
+                    bench, "remote_file_size", side_effect=lambda *_: len(creations)
+                ), mock.patch.object(
+                    bench, "collect_file_since", side_effect=collect_ublk
+                ) as ublk_collector, mock.patch.object(
                     bench.time, "sleep"
                 ):
                     self.assertEqual(bench.main(), 1 if fail_migration else 0)
@@ -478,6 +522,9 @@ class RunnerTests(unittest.TestCase):
                     cursors, [(host, n) for n in (0, 8) for host in ("root@gw", "root@a", "root@b")]
                 )
                 self.assertEqual(collector.call_count, 3)
+                self.assertEqual(ublk_collector.call_count, 2)
+                self.assertTrue((run_dir / "logs" / "node-a-ublk.log").is_file())
+                self.assertTrue((run_dir / "logs" / "node-b-ublk.log").is_file())
                 self.assertEqual(
                     len(json.loads((run_dir / "run-info.json").read_text())["migrations"]), 8
                 )

@@ -394,6 +394,7 @@ python3 scripts/run-migration-test.py \
 | node-b SSH | `root@10.10.10.2` | `AENV_BENCH_TARGET_SSH` |
 | Gateway 服务 | `aenv-gateway` | `AENV_BENCH_GATEWAY_UNIT` |
 | Runtime 服务 | `agentenv` | `AENV_BENCH_RUNTIME_UNIT` |
+| ublk daemon 日志 | `/var/lib/aenv/logs/ublk-daemon.log` | `AENV_BENCH_UBLK_LOG_PATH` |
 
 运行前确认 node-a 能免密访问 node-b：
 
@@ -409,10 +410,12 @@ artifacts/migration-runs/20261026-143000-c4/
 └── logs/
     ├── gateway.log
     ├── node-a.log
-    └── node-b.log
+    ├── node-b.log
+    ├── node-a-ublk.log
+    └── node-b-ublk.log
 ```
 
-脚本在测试前记录三个 systemd journal cursor，结束时保存 cursor 之后的完整服务日志，因此不依赖两台节点时钟完全一致。`run-info.json` 保存镜像、并发数、沙箱 ID、创建结果、迁移响应和整批耗时，但不会保存 `AENV_API_KEY`。
+脚本在测试前记录三个 systemd journal cursor，同时记录 node-a 和 node-b 的 ublk daemon 日志字节偏移。结束时只保存这些边界之后的日志，既不依赖两台节点时钟完全一致，也不会把以前测试的 OverlayBD 读取记录混入本轮。`run-info.json` 保存镜像、并发数、沙箱 ID、创建结果、迁移响应和整批耗时，但不会保存 `AENV_API_KEY`。
 
 任意创建或迁移失败时，脚本仍会先采集三份日志，然后以非零状态退出：
 
@@ -448,6 +451,7 @@ python3 scripts/run-migration-test.py \
 | `--sandbox-memory-mb 2048` | 每个沙箱分配 2048 MiB 内存，必须明显大于内存 workload |
 | `--sandbox-disk-mb 65536` | 每个沙箱的虚拟磁盘容量，默认已经是 65536 MiB |
 | `--aenv-binary` | `aenv` CLI 的路径；命令不在 `PATH` 时可写 `/opt/agentenv/bin/aenv` |
+| `--ublk-log-path` | 两个 Runtime 节点上 `uvm-ublk-daemon` 的日志路径，默认 `/var/lib/aenv/logs/ublk-daemon.log` |
 
 脚本的实际顺序是：创建沙箱、等待 Gateway 识别源节点、写入随机数据并记录 SHA-256、并发迁移、在目标节点通过 Gateway 执行 `sha256sum`。`sha256sum` 必须完整读取文件，因此它同时承担“触发迁移后读取”和“确认字节没有损坏”两项工作。
 
@@ -464,6 +468,15 @@ SUCCESS: all 1 sandboxes migrated to node-b
 - `post_migration_read_batch_duration_ms`：所有沙箱完成迁移后读校验的整批墙钟时间。
 
 `migration-summary.log` 的 `POST-MIGRATION BYTE READS` 表也会列出每个沙箱的内存、磁盘读取结果。这里的 `duration_ms` 包含 `aenv exec` 控制面开销和 `sha256sum` 计算时间，适合先判断链路是否打通；它还不是纯 P2P 网络带宽。
+
+新版 `uvm-ublk-daemon` 还会把 OverlayBD layer 的真实后台下载和按需读取记入日志。汇总文件中：
+
+- `OVERLAYBD LAYER READS` 按节点、`read_path` 和数据源统计 range 数、字节数、累计耗时和吞吐；
+- `read_path=background_download` 表示后台整层下载，`read_path=on_demand` 表示沙箱触发的按需 range 读取；
+- `source=p2p` 能直接证明字节由当前 P2P 后端传输；`source=oss` 表示从 OSS/S3 读取；
+- `OVERLAYBD P2P FALLBACKS` 统计 P2P 失败后回退 OSS/S3 的次数和请求字节数。
+
+这些表来自 `node-a-ublk.log` 和 `node-b-ublk.log`，与 `POST-MIGRATION BYTE READS` 的 guest 端到端耗时是两种不同口径。
 
 如果在非 root 用户下运行，本机日志采集要求无交互的 `sudo` 权限；node-b 日志采集要求 SSH 用户可以直接执行 `journalctl`。完整日志可能包含运行环境信息，复制到其他环境前应自行检查。
 

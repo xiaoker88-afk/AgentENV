@@ -74,6 +74,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gateway-unit", default=env("AENV_BENCH_GATEWAY_UNIT", "aenv-gateway"))
     parser.add_argument("--runtime-unit", default=env("AENV_BENCH_RUNTIME_UNIT", "agentenv"))
     parser.add_argument(
+        "--ublk-log-path",
+        default=env("AENV_BENCH_UBLK_LOG_PATH", "/var/lib/aenv/logs/ublk-daemon.log"),
+        help="uvm-ublk-daemon log path on both runtime nodes",
+    )
+    parser.add_argument(
         "--transport",
         choices=("urma", "iroh", "composite", "disabled", "unknown"),
         default=os.environ.get("AENV_BENCH_TRANSPORT"),
@@ -188,6 +193,41 @@ def collect_journal(
         )
     if result.returncode != 0:
         return result.stderr.strip() or f"journalctl exited with {result.returncode}"
+    return None
+
+
+def remote_file_size(target_ssh: str | None, path: str, label: str) -> int:
+    result = run_command(host_command(target_ssh, ["stat", "-c", "%s", "--", path]))
+    if result.returncode != 0:
+        raise TestFailure(f"cannot read {label} file size for {path}: {result.stderr.strip()}")
+    try:
+        return int(result.stdout.strip())
+    except ValueError as error:
+        raise TestFailure(f"invalid {label} file size for {path}: {result.stdout!r}") from error
+
+
+def collect_file_since(
+    target_ssh: str | None,
+    path: str,
+    offset: int,
+    destination: pathlib.Path,
+) -> str | None:
+    try:
+        current_size = remote_file_size(target_ssh, path, "ublk log")
+    except TestFailure as error:
+        destination.touch()
+        return str(error)
+    rotated = current_size < offset
+    start = 1 if rotated else offset + 1
+    command = host_command(target_ssh, ["tail", "-c", f"+{start}", "--", path])
+    with destination.open("w", encoding="utf-8") as stream:
+        result = subprocess.run(
+            command, stdout=stream, stderr=subprocess.PIPE, text=True, check=False, timeout=60
+        )
+    if result.returncode != 0:
+        return result.stderr.strip() or f"tail exited with {result.returncode}"
+    if rotated:
+        return f"{path} rotated during the run; collected the current file from byte 0"
     return None
 
 
@@ -512,6 +552,7 @@ def read_events(log_paths: list[pathlib.Path]) -> tuple[list[dict], list[str], d
             .replace("nodea", "node-a")
             .replace("nodeb", "node-b")
         )
+        node = node.removesuffix("-ublk")
         coverage = counts["nodes"][node]  # Include empty journals in coverage diagnostics.
         with path.open(encoding="utf-8", errors="replace") as stream:
             for number, raw in enumerate(stream, 1):
@@ -572,6 +613,32 @@ def read_events(log_paths: list[pathlib.Path]) -> tuple[list[dict], list[str], d
                                     "status": fields.get("status", "ok"),
                                 }
                             )
+                        continue
+                    if "overlaybd layer range read" in message:
+                        duration = float(fields["duration_ms"])
+                        byte_count = int(fields.get("bytes", 0))
+                        if not math.isfinite(duration) or duration < 0 or byte_count < 0:
+                            raise ValueError("invalid overlaybd layer read timing")
+                        events.append(
+                            {
+                                **fields,
+                                "node": node,
+                                "kind": "overlaybd_read",
+                                "duration_ms": duration,
+                                "bytes": byte_count,
+                                "status": fields.get("status", "ok"),
+                            }
+                        )
+                        continue
+                    if "overlaybd P2P layer range failed; falling back to OSS" in message:
+                        events.append(
+                            {
+                                **fields,
+                                "node": node,
+                                "kind": "overlaybd_fallback",
+                                "bytes": int(fields.get("bytes", 0)),
+                            }
+                        )
                         continue
                     # Decode before checking levels: gateway JSON uses lowercase warn/error.
                     level = fields.get("level", "")
@@ -716,6 +783,39 @@ def stage_statistics(events: list[dict]) -> list[dict]:
     return rows
 
 
+def overlaybd_read_statistics(events: list[dict]) -> list[dict]:
+    grouped: dict[tuple, list[dict]] = defaultdict(list)
+    for event in events:
+        if event["kind"] == "overlaybd_read":
+            grouped[
+                (
+                    event["node"],
+                    event.get("read_path", "unknown"),
+                    event.get("source", "unknown"),
+                    event.get("status", "ok"),
+                )
+            ].append(event)
+    rows = []
+    for (node, read_path, source, status), samples in sorted(grouped.items()):
+        total_bytes = sum(int(event["bytes"]) for event in samples)
+        total_ms = sum(float(event["duration_ms"]) for event in samples)
+        rows.append(
+            {
+                "node": node,
+                "read_path": read_path,
+                "source": source,
+                "status": status,
+                "ranges": len(samples),
+                "bytes": total_bytes,
+                "duration_ms": total_ms,
+                "throughput_mib_s": total_bytes / (1024 * 1024) / (total_ms / 1000)
+                if total_ms > 0
+                else 0.0,
+            }
+        )
+    return rows
+
+
 def summarize_run(
     run_dir: pathlib.Path, output: pathlib.Path | None = None, transport: str | None = None
 ) -> pathlib.Path:
@@ -760,6 +860,7 @@ def summarize_run(
         "migration_batch_duration_ms",
         "post_migration_read_batch_duration_ms",
         "journal_scope",
+        "ublk_log_path",
         "hosts",
         "errors",
     ):
@@ -848,6 +949,27 @@ def summarize_run(
                 )
     urma_rows = stage_statistics(timings)
     table("URMA STAGES", urma_rows)
+    overlaybd_rows = overlaybd_read_statistics(events)
+    lines += [
+        "",
+        "OVERLAYBD LAYER READS",
+        "node read_path source status ranges bytes duration_ms throughput_mib_s",
+    ]
+    for row in overlaybd_rows:
+        lines.append(
+            "{node} {read_path} {source} {status} {ranges} {bytes} "
+            "{duration_ms:.3f} {throughput_mib_s:.3f}".format(**row)
+        )
+    fallback_groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for event in events:
+        if event["kind"] == "overlaybd_fallback":
+            fallback_groups[(event["node"], event.get("read_path", "unknown"))].append(event)
+    lines += ["", "OVERLAYBD P2P FALLBACKS", "node read_path count requested_bytes"]
+    for (node, read_path), samples in sorted(fallback_groups.items()):
+        lines.append(
+            f"{node} {read_path} {len(samples)} "
+            f"{sum(int(event.get('bytes', 0)) for event in samples)}"
+        )
     lines += [
         "",
         "SLOWEST URMA SAMPLES (up to 2 per node/stage/status; shared keys are not assigned to one sandbox)",
@@ -879,7 +1001,7 @@ def summarize_run(
     lines += [
         "",
         "DIAGNOSTICS",
-        f"input_lines={counts['lines']} migration_events={len(pipeline)} linked_urma_timings={len(timings)} unlinked_urma_timings={unlinked}",
+        f"input_lines={counts['lines']} migration_events={len(pipeline)} linked_urma_timings={len(timings)} unlinked_urma_timings={unlinked} overlaybd_reads={sum(row['ranges'] for row in overlaybd_rows)}",
         f"parse_errors={counts['parse_errors']} warning_lines={counts['warning_lines']} retained_warning_lines={len(warnings)}",
         f"missing_migration_total={','.join(missing) or 'none'}",
     ]
@@ -973,14 +1095,19 @@ def main() -> int:
         "post_migration_reads": [],
         "errors": [],
         "journal_scope": "preparation",
+        "ublk_log_path": args.ublk_log_path,
     }
     write_run_info(run_info_path, run_info)
     cursors: dict[str, str] = {}
+    ublk_offsets: dict[str, int] = {}
     exit_code = 0
     try:
         for label, (target, unit) in hosts.items():
             ensure_service_active(target, unit, label)
             cursors[label] = journal_cursor(target, unit, label)
+        for label in ("node-a", "node-b"):
+            target, _ = hosts[label]
+            ublk_offsets[label] = remote_file_size(target, args.ublk_log_path, f"{label} ublk log")
         creation_started = time.monotonic()
         for index in range(args.concurrency):
             print(f"[create {index + 1}/{args.concurrency}] {args.image}", flush=True)
@@ -1032,6 +1159,9 @@ def main() -> int:
         # Exclude image creation and its URMA traffic from migration statistics.
         for label, (target, unit) in hosts.items():
             cursors[label] = journal_cursor(target, unit, label)
+        for label in ("node-a", "node-b"):
+            target, _ = hosts[label]
+            ublk_offsets[label] = remote_file_size(target, args.ublk_log_path, f"{label} ublk log")
         run_info["journal_scope"] = "migration, post-migration reads, plus 1s drain"
         print(f"[migrate] submitting {len(sandbox_ids)} concurrent migrations", flush=True)
         migration_started = time.monotonic()
@@ -1096,7 +1226,7 @@ def main() -> int:
         print(f"ERROR: {error}", file=sys.stderr)
     finally:
         time.sleep(1)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             jobs = {}
             for label, (target, unit) in hosts.items():
                 destination = run_dir / "logs" / f"{label}.log"
@@ -1104,6 +1234,21 @@ def main() -> int:
                     jobs[
                         executor.submit(collect_journal, target, unit, cursors[label], destination)
                     ] = label
+                else:
+                    destination.touch()
+            for label in ("node-a", "node-b"):
+                target, _ = hosts[label]
+                destination = run_dir / "logs" / f"{label}-ublk.log"
+                if label in ublk_offsets:
+                    jobs[
+                        executor.submit(
+                            collect_file_since,
+                            target,
+                            args.ublk_log_path,
+                            ublk_offsets[label],
+                            destination,
+                        )
+                    ] = f"{label} ublk"
                 else:
                     destination.touch()
             for future in concurrent.futures.as_completed(jobs):
