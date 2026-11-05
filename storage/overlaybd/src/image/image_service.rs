@@ -379,7 +379,7 @@ impl ImageService {
         // back to OSS; bytes from either source populate the same cache entry.
         if Self::is_oss_url(url) {
             let source = self
-                .wrap_oss_source_with_p2p(url, source_size, source)
+                .wrap_oss_source_with_p2p(url, source_size, source, "on_demand")
                 .await?;
             if let Some(cache) = remote_runtime.file_cache.as_ref() {
                 let cache_file = Self::open_cached_blob(cache, url, source, source_size).await?;
@@ -414,6 +414,9 @@ impl ImageService {
             .as_ref()
             .context("background download requires a file cache backend")?;
         let source = self.open_backend_source_with_size(url, source_size).await?;
+        let source = self
+            .wrap_oss_source_with_p2p(url, source_size, source, "background_download")
+            .await?;
         let cache_file = Self::open_cached_blob(cache, url, source, source_size).await?;
         Ok((
             cache_file.clone(),
@@ -513,6 +516,9 @@ impl ImageService {
         let mut layers = Vec::with_capacity(refs.len());
         for (url, digest, size) in refs {
             let source = self.open_backend_source_with_size(&url, Some(size)).await?;
+            let source = self
+                .wrap_oss_source_with_p2p(&url, Some(size), source, "startup_prefetch")
+                .await?;
             let file = Self::open_cached_blob(cache, &url, source.clone(), Some(size)).await?;
             layers.push(StartupPackLayer {
                 digest,
@@ -601,7 +607,11 @@ impl ImageService {
         url: &str,
         source_size: Option<u64>,
         oss_source: Arc<dyn VirtualFile>,
+        read_path: &'static str,
     ) -> Result<Arc<dyn VirtualFile>> {
+        if !Self::is_oss_url(url) {
+            return Ok(oss_source);
+        }
         let Some(digest) = Self::digest_from_blob_url(url) else {
             return Ok(oss_source);
         };
@@ -617,6 +627,7 @@ impl ImageService {
             p2p_source,
             oss_source,
             digest,
+            read_path,
             size,
         )))
     }
