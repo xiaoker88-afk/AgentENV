@@ -593,7 +593,8 @@ def read_events(log_paths: list[pathlib.Path]) -> tuple[list[dict], list[str], d
                     if "urma read window started" in message:
                         events.append({**fields, "node": node, "kind": "window"})
                         continue
-                    if "urma stage timing" in message or "urma read range timing" in message:
+                    if ("urma stage timing" in message or "urma read range timing" in message
+                            or "iroh stage timing" in message):
                         durations = (
                             BREAKDOWN
                             if "urma read range timing" in message
@@ -756,7 +757,7 @@ def stage_statistics(events: list[dict]) -> list[dict]:
             (
                 event["node"],
                 event["stage"],
-                event.get("source") or "-",
+                "-" if event.get("kind") == "urma" else (event.get("source") or "-"),
                 event.get("status") or "unknown",
             )
         ].append(event)
@@ -948,7 +949,7 @@ def summarize_run(
                     f"{artifact.get('checksum_matches', False)}"
                 )
     urma_rows = stage_statistics(timings)
-    table("URMA STAGES", urma_rows)
+    table("P2P STAGES", urma_rows)
     overlaybd_rows = overlaybd_read_statistics(events)
     lines += [
         "",
@@ -960,6 +961,37 @@ def summarize_run(
             "{node} {read_path} {source} {status} {ranges} {bytes} "
             "{duration_ms:.3f} {throughput_mib_s:.3f}".format(**row)
         )
+    def event_ms(event):
+        if event.get("timestamp_unix_ms"):
+            return float(event["timestamp_unix_ms"])
+        try:
+            return dt.datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).timestamp() * 1000
+        except (KeyError, ValueError):
+            return None
+
+    ready_times = defaultdict(list)
+    for event in pipeline:
+        stamp = event_ms(event)
+        if event["stage"] == "restore_envd_wait" and stamp is not None:
+            ready_times[event["node"]].append(stamp)
+    phase_groups = defaultdict(lambda: [0, 0])
+    for event in events:
+        if event["kind"] != "overlaybd_read":
+            continue
+        stamp = event_ms(event)
+        bounds = ready_times[event["node"]]
+        phase = "unknown"
+        if stamp is not None and bounds:
+            start = stamp - float(event["duration_ms"])
+            phase = ("before_first_envd" if stamp < min(bounds) else
+                     "after_all_envd" if start >= max(bounds) else "mixed_or_crossing")
+        key = (event["node"], phase, event.get("read_path", "unknown"), event.get("source", "unknown"))
+        phase_groups[key][0] += 1
+        phase_groups[key][1] += int(event["bytes"])
+    lines += ["", "LAYER READS BY ENVD BOUNDARY (node-level; concurrent sandboxes may overlap)",
+              "node phase read_path source ranges bytes"]
+    for key, (count, size) in sorted(phase_groups.items()):
+        lines.append(" ".join(key) + f" {count} {size}")
     fallback_groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for event in events:
         if event["kind"] == "overlaybd_fallback":
@@ -970,30 +1002,6 @@ def summarize_run(
             f"{node} {read_path} {len(samples)} "
             f"{sum(int(event.get('bytes', 0)) for event in samples)}"
         )
-    lines += [
-        "",
-        "SLOWEST URMA SAMPLES (up to 2 per node/stage/status; shared keys are not assigned to one sandbox)",
-    ]
-    for row in urma_rows:
-        for event in row["slowest"]:
-            compact = {
-                key: event[key]
-                for key in (
-                    "node",
-                    "stage",
-                    "status",
-                    "duration_ms",
-                    "key",
-                    "snapshot_ids",
-                    "timestamp_unix_ms",
-                    "timestamp",
-                    "bytes",
-                    "offset",
-                    "read_count",
-                )
-                if key in event
-            }
-            lines.append(json.dumps(compact, ensure_ascii=False, separators=(",", ":")))
     missing = sorted(
         expected_sandbox_ids(run_info)
         - {e.get("sandbox_id") for e in pipeline if e.get("stage") == "migration_total"}
@@ -1023,6 +1031,22 @@ def summarize_run(
         lines.append("WARNING: no migration stage events; results are incomplete.")
     lines.extend(warnings)
     lines.append("raw_logs=" + ",".join(str(path.relative_to(run_dir)) for path in logs))
+    # One portable file with cross-service phase events and aggregate layer reads.
+    # Raw per-operation logs remain local; do not duplicate them in the export.
+    combined = ["AgentENV cross-service migration timeline (milliseconds)",
+                "Successful phase records are completion timestamps; missing phases are not zero.",
+                "Layer counters include concurrent operations and possible repeated ranges."]
+    for event in sorted(pipeline, key=lambda item: float(item.get("timestamp_unix_ms", 0))):
+        combined.append(json.dumps({key: event[key] for key in (
+            "timestamp_unix_ms", "node", "sandbox_id", "snapshot_id", "stage",
+            "duration_ms", "source", "status", "size_bytes"
+        ) if key in event}, ensure_ascii=False, separators=(",", ":")))
+    combined += ["LAYER READ TOTALS (whole collection window, including post-migration reads)"]
+    combined.extend(json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+                    for row in overlaybd_rows)
+    combined += ["WARNINGS (bounded samples)", *warnings]
+    (run_dir / "migration-timeline.log").write_text("\n".join(combined) + "\n", encoding="utf-8")
+    lines.append("timeline=migration-timeline.log")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return output

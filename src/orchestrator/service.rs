@@ -2786,6 +2786,7 @@ where
             }
         }
 
+        let launch_finalize_started = std::time::Instant::now();
         // Check for shutdown again before we persist the final state and publish the proxy route.
         if self.is_shutting_down() {
             info!("orchestrator started shutting down while sandbox was becoming ready");
@@ -2855,6 +2856,16 @@ where
             }
         }
 
+        crate::observability::migration_timing::log_stage(
+            "restore_launch_finalize",
+            launch_finalize_started.elapsed(),
+            "ok",
+            Some(&sandbox_id.to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
         info!("sandbox launch completed");
         Ok(final_metadata)
     }

@@ -232,7 +232,23 @@ class ReportTests(unittest.TestCase):
         self.assertIn("WARN catalog retry", text)
         self.assertNotIn("DEBUG irrelevant", text)
         self.assertLess(output.stat().st_size, raw.stat().st_size // 10)
-        self.assertEqual(text.count('"stage":"read_window"'), 3)  # two successes, one failure
+        self.assertNotIn('"stage":"read_window"', text)
+        timeline = (self.root / "migration-timeline.log").read_text()
+        self.assertIn('"stage":"target_restore"', timeline)
+        self.assertIn("WARN catalog retry", timeline)
+
+    def test_p2p_timings_merge_paths_and_parse_iroh(self):
+        rows = bench.stage_statistics([
+            {"kind": "urma", "node": "node-a", "stage": "publish_total",
+             "source": path, "status": "ok", "duration_ms": duration}
+            for path, duration in (("/tmp/a", 10), ("/tmp/b", 20))
+        ])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["n"], 2)
+        self.log("gateway", marker())
+        self.log("node-b", 'iroh stage timing key=snapshot/v1/artifacts/snap1/vm_state.bin stage="iroh_range_download" duration_ms=3 status="ok"')
+        text = bench.summarize_run(self.root).read_text()
+        self.assertIn("iroh_range_download", text)
 
     def test_created_sandbox_without_result_is_visible(self):
         run = info()
@@ -260,6 +276,16 @@ class ReportTests(unittest.TestCase):
         self.assertIn("node-b on_demand oss ok 1 65536 4.000 15.625", text)
         self.assertIn("node-b on_demand 1 65536", text)
         self.assertIn("overlaybd_reads=2", text)
+
+    def test_layer_reads_split_at_envd_boundary(self):
+        self.log("gateway", marker())
+        self.log("node-b", marker(stage="restore_envd_wait", timestamp_unix_ms=2000))
+        self.log("node-b-ublk",
+            '1970-01-01T00:00:01Z INFO overlaybd layer range read bytes=100 duration_ms=2 source="p2p" read_path="on_demand"',
+            '1970-01-01T00:00:03Z INFO overlaybd layer range read bytes=200 duration_ms=2 source="p2p" read_path="background_download"')
+        text = bench.summarize_run(self.root).read_text()
+        self.assertIn("node-b before_first_envd on_demand p2p 1 100", text)
+        self.assertIn("node-b after_all_envd background_download p2p 1 200", text)
 
     def test_collection_streams_full_journal_and_reports_command_failure(self):
         path = self.root / "logs" / "node-b.log"

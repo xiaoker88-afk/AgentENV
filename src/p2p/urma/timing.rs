@@ -25,6 +25,14 @@ impl StageTimer {
 
 impl Drop for StageTimer {
     fn drop(&mut self) {
+        if self.status == "ok"
+            && matches!(
+                self.stage,
+                "bounce_pool_lease" | "bounce_pool_release" | "read_window" | "stream_copy_deliver"
+            )
+        {
+            return;
+        }
         tracing::info!(
             target: "agentenv::p2p::urma::timing",
             key = %self.key,

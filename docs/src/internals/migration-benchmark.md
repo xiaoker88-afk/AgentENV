@@ -66,8 +66,15 @@ python3 scripts/run-migration-test.py \
 - 三端帐号、unit、镜像、并发数、批次耗时和运行错误。
 - Gateway/运行时各阶段的样本数、均值、p50、p95、最小值、最大值，以及每个沙箱的阶段耗时。
 - URMA 发布、发现、catalog、缓冲区、READ、文件写入的分阶段统计。
-- 每个 node/stage/status 最慢的两条 URMA 记录，保留 key、关联快照、时间和数据量。
+- P2P 阶段按节点合并统计，不再按源文件路径拆成大量单行，也不再输出逐 artifact 最慢样例。
+- `migration-timeline.log` 合并三端的阶段完成事件、块层读取汇总及有限异常样例；原始日志仍在内网保留。一般只需分享 `migration-summary.log`，需要逐沙箱时间线时再分享 timeline。
+- 新 server 输出 restore_begin、restore_prepare、restore_snapshot_load、restore_resume、restore_envd_wait、restore_ready_finalize、restore_launch_finalize；成功事件为阶段结束时间，缺失不代表零耗时。
+- Iroh 输出 range 下载（含 Downloader 排队和 store 处理）、导出准备、首块观察和流被读完的计时。后两者包含消费者调度，流被提前丢弃不会输出 drained；drained 不代表内容校验成功。
+- 块层按 on_demand/background_download 与 p2p/oss 分组；另按本节点首个/最后一个 envd 就绪边界统计。并发恢复期间标记 mixed_or_crossing，不把共享层强行归给某个 sandbox。无时间戳或旧 server 无 envd 边界时标记 unknown。累计读取量包含重读，吞吐基于操作耗时累计，不是网卡墙钟带宽。
+
 - 各端原始日志行数、字节数组消息数、有效阶段数；无法关联的 timing 数、缺失的迁移总耗时、解析错误、最多 30 条警告/错误证据。
+
+日志采集应使用正常 INFO 级别；不要全局开启 DEBUG。URMA 的成功缓冲池租借/归还、READ 窗口和复制细项不再逐条输出，保留 READ 分解及失败阶段。OverlayBD 的逐范围事件仍需由脚本本地汇总，不能提前过滤掉。
 
 父阶段包含子阶段，并发操作也有重叠，不能直接相加。READ 的 `read_loop`
 包含提交和等待完成；等待时间包含执行器调度和完成通知，不等于纯硬件时延。
@@ -93,3 +100,29 @@ Bunyan 格式。journal JSON 中包含 ANSI 等不可打印字符的 `MESSAGE` �
 ```bash
 python3 -m unittest discover -s scripts/tests -p 'test_migration_benchmark.py' -v
 ```
+
+## 恢复耗时诊断与部署
+
+本次更新需要在 A、B 替换重新构建的 server，并在 A 替换测试脚本。
+Gateway 和 ublk-daemon 本次无需因代码改动而替换，但需保留现有块层读取日志功能。
+重新汇总旧 run 不需要重启服务；旧日志没有新增阶段时无法补算这些阶段。
+
+| 阶段 | 范围 |
+| --- | --- |
+| restore_begin | 开始恢复的时间点，duration 为零 |
+| restore_prepare | start_resume 内准备设备、网络和 Firecracker API 等，至加载快照前 |
+| restore_snapshot_load | Firecracker 加载快照 API 调用 |
+| restore_resume | 快照加载后调整设备、MMDS、限速器并发出 resume |
+| restore_envd_wait | 等待 guest 内 envd 就绪 |
+| restore_ready_finalize | envd 就绪后通知设备释放后台下载、初始化 envd 和挂载新增盘 |
+| restore_launch_finalize | 最终运行状态更新、代理路由和恢复记录清理 |
+
+这些阶段不是完整调用树，未埋点间隔及失败前缺失的成功阶段不能按零处理。
+当前 envd 等待阶段也会出现在普通创建路径；结合 restore_begin 和 snapshot_id
+识别是否为快照恢复。envd 就绪不意味着全部层下载完成，也不意味着 SHA256 校验完成。
+块层请求统计以完成事件分类，跨越就绪边界的请求标记 mixed_or_crossing。
+
+推荐先用相同镜像和 workload 跑 c1，对齐两端缓存清理及预热条件。
+比较 restore_envd_wait 与 on_demand 请求等待，再检查 Iroh 下载和导出耗时；
+后台下载字节不能直接当作恢复所必需的数据量。c8 共享层及并行请求不具备唯一
+sandbox 归属时，仅采用节点级统计。

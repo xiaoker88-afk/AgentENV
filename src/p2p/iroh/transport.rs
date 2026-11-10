@@ -621,12 +621,46 @@ impl P2pTransport for IrohBlobsP2pTransport {
         // A temporary tag protects downloaded bytes until the stream finishes or is dropped.
         // After that, GC may reclaim them unless background publication retains the full layer.
         let ranges = ChunkRanges::bytes(range.clone());
-        let tag = self
+        let download_started = std::time::Instant::now();
+        let downloaded = self
             .download_blob(GetRequest::blob_ranges(blob_hash, ranges), providers)
-            .await?;
+            .await;
+        info!(key = %descriptor.key, offset, bytes = len,
+            stage = "iroh_range_download", status = if downloaded.is_ok() { "ok" } else { "error" },
+            duration_ms = download_started.elapsed().as_secs_f64() * 1000.0,
+            "iroh stage timing");
+        let tag = downloaded?;
+        let export_started = std::time::Instant::now();
         let stream = self.export_local_blob_range(blob_hash, range, tag).await?;
+        info!(key = %descriptor.key, offset, bytes = len,
+            stage = "iroh_export_prepare", status = "ok",
+            duration_ms = export_started.elapsed().as_secs_f64() * 1000.0,
+            "iroh stage timing");
         debug!(providers_count, "fetched artifact range from P2P provider");
-        Ok(stream)
+        let delivery_started = std::time::Instant::now();
+        let first_key = descriptor.key.clone();
+        let final_key = descriptor.key.clone();
+        let mut first = true;
+        let measured = stream.inspect(move |_| {
+            if first {
+                first = false;
+                info!(key = %first_key, offset, bytes = len,
+                    stage = "iroh_export_first_chunk", status = "observed",
+                    duration_ms = delivery_started.elapsed().as_secs_f64() * 1000.0,
+                    "iroh stage timing");
+            }
+        });
+        // This final event requires the consumer to drain the stream. A dropped
+        // stream deliberately has no successful delivery-complete event.
+        let finished = stream::once(async move {
+            info!(key = %final_key, offset, bytes = len,
+                stage = "iroh_export_drained", status = "drained",
+                duration_ms = delivery_started.elapsed().as_secs_f64() * 1000.0,
+                "iroh stage timing");
+            None::<Result<Bytes>>
+        })
+        .filter_map(futures::future::ready);
+        Ok(Box::pin(measured.chain(finished)))
     }
 
     #[instrument(

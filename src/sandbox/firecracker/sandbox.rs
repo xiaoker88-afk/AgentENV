@@ -983,12 +983,24 @@ impl FirecrackerSandbox {
         let Some(envd_instance) = self.envd_instance.as_ref() else {
             return Err(anyhow::anyhow!("envd instance not initialized"));
         };
+        let envd_wait_started = std::time::Instant::now();
         envd_instance
             .wait_for_ready(
                 self.runtime_policy.envd_timeout,
                 self.runtime_policy.envd_poll_interval,
             )
             .await?;
+        crate::observability::migration_timing::log_stage(
+            "restore_envd_wait",
+            envd_wait_started.elapsed(),
+            "ok",
+            Some(&self.id.to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let ready_finalize_started = std::time::Instant::now();
         if let Some(tools) = &self.tools_ublk_device {
             let _ = UblkDeviceManager::global()
                 .notify_sandbox_ready(tools.image_config_path())
@@ -1026,6 +1038,16 @@ impl FirecrackerSandbox {
             Self::mount_initial_guest_drives(envd, self.initial_guest_drive_mounts.clone()).await?;
         }
 
+        crate::observability::migration_timing::log_stage(
+            "restore_ready_finalize",
+            ready_finalize_started.elapsed(),
+            "ok",
+            Some(&self.id.to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
         Ok(())
     }
 
@@ -2031,6 +2053,17 @@ impl FirecrackerSandbox {
 
     #[tracing::instrument(skip(self, config))]
     async fn start_resume(&mut self, config: FirecrackerSnapshotConfig) -> Result<()> {
+        let restore_prepare_started = std::time::Instant::now();
+        crate::observability::migration_timing::log_stage(
+            "restore_begin",
+            std::time::Duration::ZERO,
+            "ok",
+            Some(&self.id.to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
         // NOTE: The virtio-balloon device is NOT configured here. Balloon state
         // is part of vm_state.bin and is restored automatically by Firecracker.
         // Snapshots taken before balloon support was added will simply not have
@@ -2353,6 +2386,17 @@ impl FirecrackerSandbox {
 
         // Override the network interface to use the new tap0 in our namespace
         let network_overrides = [("eth0", "tap0")];
+        crate::observability::migration_timing::log_stage(
+            "restore_prepare",
+            restore_prepare_started.elapsed(),
+            "ok",
+            Some(&self.id.to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let snapshot_load_started = std::time::Instant::now();
         self.fc_instance
             .load_snapshot_file(
                 &vm_state_src,
@@ -2362,6 +2406,18 @@ impl FirecrackerSandbox {
                 config.common.track_dirty_pages,
             )
             .await?;
+
+        crate::observability::migration_timing::log_stage(
+            "restore_snapshot_load",
+            snapshot_load_started.elapsed(),
+            "ok",
+            Some(&self.id.to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let resume_started = std::time::Instant::now();
 
         // A volume absent from the source state was loaded as a placeholder.
         // Replace and PATCH it once so Firecracker reopens the path and reports
@@ -2401,6 +2457,16 @@ impl FirecrackerSandbox {
             .context("reconcile disk rate limiter on snapshot resume")?;
 
         self.fc_instance.resume().await?;
+        crate::observability::migration_timing::log_stage(
+            "restore_resume",
+            resume_started.elapsed(),
+            "ok",
+            Some(&self.id.to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
 
         debug!("sandbox restored from snapshot config");
         Ok(())

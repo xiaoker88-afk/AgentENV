@@ -479,7 +479,7 @@ impl UrmaP2pTransport {
         let scheduled = Instant::now();
         let stream_span = tracing::info_span!("urma_stream", key = %key);
         let stream = async move {
-            info!(
+            debug!(
                 key,
                 offset,
                 bytes = len,
@@ -534,7 +534,7 @@ impl UrmaP2pTransport {
                 let chunk_len = remaining.min(window);
                 let read_start = Instant::now();
                 let read_timer = StageTimer::start(&key, "read_window");
-                info!(
+                debug!(
                     key,
                     offset = pos,
                     bytes = chunk_len,
