@@ -131,6 +131,9 @@ Scheduler keeps this artifact index in memory and stores only key-to-node mappin
 
 `src/snapshot/p2p.rs` is the snapshot-store integration layer. It is intentionally small: the snapshot manager publishes artifacts after the configured repository commit succeeds, and runtime resolvers treat P2P as an optional acceleration path rather than committed truth.
 
+For captured OSS snapshots, the manager may call `P2pTransport::prepare_publish` concurrently with repository publication. The optional returned `PreparedP2pPublication` owns private resources: preparation must not expose catalog entries or discovery hints, and dropping it releases unused resources. URMA implements this with mmap plus segment registration on a blocking worker; unsupported transports return `None`. Only after repository commit does the manager activate preparations whose full artifact identity (key, source, mode, metadata) matches the final publication. Recontainerized or dense-exported layers that no longer match use the ordinary post-commit path. POSIX snapshots retain the original behavior. The captured snapshot remains alive throughout the scoped operation.
+
+
 Snapshot publication advertises:
 
 - Fixed Firecracker artifacts under `snapshot/v1/artifacts/{snapshot_id}/{relative_path}`:

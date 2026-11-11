@@ -96,6 +96,19 @@ fn evict_lru<K: std::hash::Hash + Eq + Clone, T>(map: &mut HashMap<K, LruSlot<T>
     map.remove(&victim).map(|slot| slot.value)
 }
 
+pub(crate) struct PreparedSegment {
+    context: Arc<UrmaContext>,
+    entry: Option<PublishedSegment>,
+}
+
+impl Drop for PreparedSegment {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            let _ = self.context.ops().unregister_seg(entry.tseg);
+        }
+    }
+}
+
 /// Publish-side registry of local segments with LRU eviction at capacity.
 pub struct SegmentRegistry {
     context: Arc<UrmaContext>,
@@ -138,6 +151,16 @@ impl SegmentRegistry {
             }
         }
 
+        let prepared = self.prepare(key, addr, len)?;
+        Ok(self.activate(prepared))
+    }
+
+    pub(crate) fn prepare(&self, key: &str, addr: usize, len: u64) -> P2pResult<PreparedSegment> {
+        if len == 0 {
+            return Err(P2pError::Internal(anyhow::anyhow!(
+                "cannot register empty segment"
+            )));
+        }
         let registered = self
             .context
             .ops()
@@ -163,6 +186,19 @@ impl SegmentRegistry {
             len,
         };
 
+        Ok(PreparedSegment {
+            context: self.context.clone(),
+            entry: Some(entry),
+        })
+    }
+
+    pub(crate) fn activate(&self, mut prepared: PreparedSegment) -> UrmaLocator {
+        let entry = prepared
+            .entry
+            .take()
+            .expect("prepared segment consumed once");
+        let key = entry.key.clone();
+        let locator = entry.locator.clone();
         let mut segments = self.segments.lock().unwrap();
         // LRU eviction: drop the least recently used published segment when
         // at capacity. (The transport's `local_artifacts` entry keeps the
@@ -188,7 +224,7 @@ impl SegmentRegistry {
                 last_used: self.clock.tick(),
             },
         );
-        Ok(locator)
+        locator
     }
 
     /// Look up the locator advertised for a locally published key (and
@@ -359,6 +395,39 @@ mod tests {
         assert!(encoded.starts_with("urma1:"));
         assert_eq!(UrmaLocator::decode(&encoded), Some(locator));
         assert!(UrmaLocator::decode("iroh:garbage").is_none());
+    }
+
+    #[tokio::test]
+    async fn prepared_segment_is_private_and_drop_unregisters() {
+        let ops = MockUrmaOps::new();
+        let context = Arc::new(UrmaContext::mock(ops.clone()).unwrap());
+        let registry = SegmentRegistry::new(context, serve_id(), 8);
+        let buf = vec![0u8; 4096];
+        let prepared = registry
+            .prepare("pending", buf.as_ptr() as usize, 4096)
+            .unwrap();
+        assert!(registry.locator("pending").is_none());
+        assert_eq!(ops.status.lock().unwrap().registered.len(), 1);
+        drop(prepared);
+        assert!(registry.locator("pending").is_none());
+        assert_eq!(ops.status.lock().unwrap().unregistered, 1);
+    }
+
+    #[tokio::test]
+    async fn prepared_segment_activates_without_registering_again() {
+        let ops = MockUrmaOps::new();
+        let context = Arc::new(UrmaContext::mock(ops.clone()).unwrap());
+        let registry = SegmentRegistry::new(context, serve_id(), 8);
+        let buf = vec![0u8; 4096];
+        let prepared = registry
+            .prepare("pending", buf.as_ptr() as usize, 4096)
+            .unwrap();
+        let locator = registry.activate(prepared);
+        assert_eq!(registry.locator("pending"), Some(locator));
+        assert_eq!(ops.status.lock().unwrap().registered.len(), 1);
+        assert_eq!(ops.status.lock().unwrap().unregistered, 0);
+        assert!(registry.unregister("pending"));
+        assert_eq!(ops.status.lock().unwrap().unregistered, 1);
     }
 
     #[tokio::test]

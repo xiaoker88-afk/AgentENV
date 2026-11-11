@@ -206,6 +206,13 @@ impl super::transport::P2pTransport for InstrumentedP2pTransport {
         .await
     }
 
+    async fn prepare_publish(
+        &self,
+        request: &super::types::P2pPublishRequest,
+    ) -> super::error::Result<Option<Box<dyn super::transport::PreparedP2pPublication>>> {
+        self.inner.prepare_publish(request).await
+    }
+
     async fn publish(&self, request: &super::types::P2pPublishRequest) -> super::error::Result<()> {
         self.inner.publish(request).await
     }

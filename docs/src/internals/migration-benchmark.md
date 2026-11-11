@@ -128,3 +128,11 @@ Gateway 和 ublk-daemon 本次无需因代码改动而替换，但需保留现�
 比较 restore_envd_wait 与 on_demand 请求等待，再检查 Iroh 下载和导出耗时；
 后台下载字节不能直接当作恢复所必需的数据量。c8 共享层及并行请求不具备唯一
 sandbox 归属时，仅采用节点级统计。
+
+### URMA 注册与 OSS 发布重叠
+
+捕获快照的 OSS 发布会与 P2P 私有准备并行。URMA 在阻塞线程中 mmap、注册捕获时已有的本地层和 VM state；此时不进入 catalog，也不发布发现信息。仓库提交成功后，仅将 key、来源路径、元数据与最终发布项一致的准备结果正式发布。被压缩、重新导出或未引用的候选注册自动释放，仍按最终上传文件正常发布；准备失败也回退到原有提交后发布流程。没有提前返回快照成功，也不改变 Gateway 迁移 API。
+
+`p2p.transport = "urma"` 支持提前注册；Iroh、composite 等未实现私有准备的传输保留提交后发布行为。POSIX 发布流程不启用该优化。
+
+新增 `snapshot_p2p_prepare` 表示并行准备阶段（best effort），URMA 的 `prepare_register_segment` 表示实际注册耗时。`snapshot_repository_publish` 与准备阶段重叠，不能相加；`snapshot_p2p_publish` 现在主要表示提交后的剩余发布耗时。观察 `source_snapshot` 总耗时确认优化效果。需要更新 A 端 server，B 端不需要为此改变恢复协议。

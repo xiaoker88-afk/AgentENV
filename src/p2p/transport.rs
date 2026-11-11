@@ -12,6 +12,13 @@ use futures::Stream;
 
 pub type P2pByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send + 'static>>;
 
+/// A private prepared publication. Dropping it releases unpublished resources.
+/// Only `publish` may make the artifact visible to peers.
+#[async_trait]
+pub trait PreparedP2pPublication: Send {
+    async fn publish(self: Box<Self>) -> Result<()>;
+}
+
 #[async_trait]
 /// Abstraction for artifact discovery and transfer between peers.
 pub trait P2pTransport: Send + Sync {
@@ -71,6 +78,15 @@ pub trait P2pTransport: Send + Sync {
         offset: u64,
         len: usize,
     ) -> Result<P2pByteStream>;
+
+    /// Prepare resources without advertising them. Unsupported backends use
+    /// the ordinary post-commit publication path.
+    async fn prepare_publish(
+        &self,
+        _request: &P2pPublishRequest,
+    ) -> Result<Option<Box<dyn PreparedP2pPublication>>> {
+        Ok(None)
+    }
 
     /// Publish a local artifact to the transport.
     ///
