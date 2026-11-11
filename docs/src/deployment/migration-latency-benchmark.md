@@ -384,6 +384,23 @@ python3 scripts/run-migration-test.py \
 
 `--concurrency 4` 表示先在 node-a 顺序创建四个不同沙箱，确认 Gateway 能解析它们的源节点后，同时向 node-b 发出四个迁移请求。创建耗时单独记录，不计入 `migration_batch_duration_ms`。
 
+每轮开始时，脚本默认先构造目标节点的冷缓存环境。它从目标节点 `agentenv` systemd 服务的 `AENV_CONFIG_PATH` 和 `AENV_HOME_PATH` 出发，读取实际 TOML 配置以及程序生成的两份 OverlayBD JSON，得到并清理以下**真实配置路径**：
+
+- rootfs OverlayBD JSON 中的 `cacheConfig.cacheDir`；
+- 内存快照 OverlayBD JSON 中的 `cacheConfig.cacheDir`；
+- `[p2p].store_dir` 下的 `iroh` 本地存储目录。
+
+清理时会先停止目标节点 `agentenv`，只删除上述目录中的内容，然后重新创建目录、启动服务并确认服务为 `active`。它不会删除 OSS/S3 对象、快照仓库、镜像转换缓存、源节点 P2P 数据或沙箱持久化状态。因为会短暂停止目标 Runtime，这个操作只应在专用测试节点执行，不要在承载其他业务沙箱的节点使用。
+
+如果本轮需要测热缓存，显式关闭清理：
+
+```bash
+python3 scripts/run-migration-test.py \
+  --concurrency 4 \
+  --image 141.61.17.188:5000/agentenv-lab/sandbox-small:v1 \
+  --no-clear-target-cache
+```
+
 针对当前双节点环境，默认值为：
 
 | 项目 | 默认值 | 覆盖环境变量 |
@@ -395,6 +412,8 @@ python3 scripts/run-migration-test.py \
 | Gateway 服务 | `aenv-gateway` | `AENV_BENCH_GATEWAY_UNIT` |
 | Runtime 服务 | `agentenv` | `AENV_BENCH_RUNTIME_UNIT` |
 | ublk daemon 日志 | `/var/lib/aenv/logs/ublk-daemon.log` | `AENV_BENCH_UBLK_LOG_PATH` |
+
+目标节点需要允许脚本使用 SSH 执行 `systemctl stop/start agentenv` 和 `python3`。默认以 `root@...` 连接，因此不需要额外 `sudo`。`run-info.json` 的 `target_cache_cleanup` 会记录本轮是否清理成功、实际路径和每个目录删除的顶层条目数。
 
 运行前确认 node-a 能免密访问 node-b：
 
@@ -452,6 +471,7 @@ python3 scripts/run-migration-test.py \
 | `--sandbox-disk-mb 65536` | 每个沙箱的虚拟磁盘容量，默认已经是 65536 MiB |
 | `--aenv-binary` | `aenv` CLI 的路径；命令不在 `PATH` 时可写 `/opt/agentenv/bin/aenv` |
 | `--ublk-log-path` | 两个 Runtime 节点上 `uvm-ublk-daemon` 的日志路径，默认 `/var/lib/aenv/logs/ublk-daemon.log` |
+| `--no-clear-target-cache` | 保留目标节点 OverlayBD 和 Iroh 缓存，用于热缓存测试；默认不加该参数，即每轮先清理 |
 
 脚本的实际顺序是：创建沙箱、等待 Gateway 识别源节点、写入随机数据并记录 SHA-256、并发迁移、在目标节点通过 Gateway 执行 `sha256sum`。`sha256sum` 必须完整读取文件，因此它同时承担“触发迁移后读取”和“确认字节没有损坏”两项工作。
 
@@ -673,7 +693,7 @@ migration_total
 
 1. 不在运行沙箱时直接删除整个 `/var/lib/aenv`。
 2. 为每个 transport 使用新的 S3 `prefix` 和新建快照，最容易隔离实验。
-3. 如果需要冷缓存，先停止 Runtime，再只处理明确的测试专用 cache 路径，并保留可恢复备份。
+3. 脚本默认停止目标 Runtime，并按实际配置清理 OverlayBD 与 Iroh cache；热缓存实验才使用 `--no-clear-target-cache`。
 4. 三种 transport 使用相同 MinIO、server commit、沙箱 workload 和并发顺序。
 5. 轮换测试顺序，降低温度、缓存和后台任务产生的系统性偏差。
 6. 同时记录 CPU、内存、磁盘和网络/UB 利用率；只看延迟不能解释瓶颈。

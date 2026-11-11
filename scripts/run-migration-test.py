@@ -74,6 +74,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gateway-unit", default=env("AENV_BENCH_GATEWAY_UNIT", "aenv-gateway"))
     parser.add_argument("--runtime-unit", default=env("AENV_BENCH_RUNTIME_UNIT", "agentenv"))
     parser.add_argument(
+        "--no-clear-target-cache",
+        dest="clear_target_cache",
+        action="store_false",
+        help="keep target OverlayBD and Iroh caches instead of clearing them before the run",
+    )
+    parser.set_defaults(clear_target_cache=True)
+    parser.add_argument(
         "--ublk-log-path",
         default=env("AENV_BENCH_UBLK_LOG_PATH", "/var/lib/aenv/logs/ublk-daemon.log"),
         help="uvm-ublk-daemon log path on both runtime nodes",
@@ -159,6 +166,187 @@ def ensure_service_active(target_ssh: str | None, unit: str, label: str) -> None
     if result.returncode != 0 or result.stdout.strip() != "active":
         detail = result.stderr.strip() or result.stdout.strip() or "unknown status"
         raise TestFailure(f"{label} service {unit!r} is not active: {detail}")
+
+
+def service_environment(target_ssh: str | None, unit: str) -> dict[str, str]:
+    result = run_command(
+        host_command(target_ssh, ["systemctl", "show", "--property=Environment", "--value", unit])
+    )
+    if result.returncode != 0:
+        raise TestFailure(
+            f"cannot read target service {unit!r} environment: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    values: dict[str, str] = {}
+    for item in shlex.split(result.stdout):
+        name, separator, value = item.partition("=")
+        if separator:
+            values[name] = value
+    return values
+
+
+DISCOVER_TARGET_CACHE_SCRIPT = r"""
+import json
+import pathlib
+import re
+import sys
+
+config_path = pathlib.Path(sys.argv[1])
+home_override = sys.argv[2]
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None
+
+if tomllib is not None:
+    with config_path.open("rb") as stream:
+        config = tomllib.load(stream)
+else:
+    config = {}
+    section = config
+    wanted = {"home_path", "global_config_path", "overlaybd_global_config_path", "store_dir"}
+    for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        match = re.fullmatch(r"\[([^]]+)]", line)
+        if match:
+            section = config
+            for name in match.group(1).split("."):
+                section = section.setdefault(name, {})
+            continue
+        match = re.match(r"([A-Za-z0-9_]+)\s*=\s*(['\"])(.*?)\2\s*(?:#.*)?$", line)
+        if match and match.group(1) in wanted:
+            section[match.group(1)] = match.group(3)
+
+home = pathlib.Path(home_override or config.get("home_path", "/var/lib/aenv"))
+if not home.is_absolute():
+    home = config_path.parent / home
+home = home.resolve(strict=False)
+
+def resolve(value):
+    value = str(value).replace("$AENV_HOME", str(home))
+    path = pathlib.Path(value)
+    if not path.is_absolute():
+        path = config_path.parent / path
+    return path.resolve(strict=False)
+
+ublk = config.get("ublk", {}).get("overlaybd", {})
+memory = config.get("memory_snapshot", {})
+p2p = config.get("p2p", {})
+global_configs = [
+    resolve(ublk.get("global_config_path", "$AENV_HOME/overlaybd/overlaybd-global.json")),
+    resolve(memory.get("overlaybd_global_config_path", "$AENV_HOME/overlaybd/mem-overlaybd-global.json")),
+]
+
+targets = []
+for kind, path in zip(("overlaybd_rootfs", "overlaybd_memory"), global_configs):
+    with path.open(encoding="utf-8") as stream:
+        generated = json.load(stream)
+    cache_dir = generated.get("cacheConfig", {}).get("cacheDir")
+    if not cache_dir:
+        raise SystemExit(f"missing cacheConfig.cacheDir in {path}")
+    targets.append({"kind": kind, "path": str(resolve(cache_dir))})
+
+p2p_store = resolve(p2p.get("store_dir", "$AENV_HOME/p2p/store"))
+targets.append({"kind": "iroh_store", "path": str(p2p_store / "iroh")})
+print(json.dumps({"home": str(home), "targets": targets}, separators=(",", ":")))
+"""
+
+
+CLEAR_TARGET_CACHE_SCRIPT = r"""
+import json
+import pathlib
+import shutil
+import sys
+
+spec = json.loads(sys.argv[1])
+home = pathlib.Path(spec["home"]).resolve(strict=False)
+results = []
+for entry in spec["targets"]:
+    path = pathlib.Path(entry["path"])
+    resolved = path.resolve(strict=False)
+    if not path.is_absolute() or resolved in (pathlib.Path("/"), home):
+        raise SystemExit(f"refusing unsafe cache path: {path}")
+    if path.is_symlink():
+        raise SystemExit(f"refusing symlink cache path: {path}")
+    removed = 0
+    if path.exists():
+        if not path.is_dir():
+            raise SystemExit(f"cache path is not a directory: {path}")
+        for child in path.iterdir():
+            if child.is_symlink() or child.is_file():
+                child.unlink()
+            elif child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+            removed += 1
+    path.mkdir(parents=True, exist_ok=True)
+    results.append({"kind": entry["kind"], "path": str(path), "removed_entries": removed})
+print(json.dumps(results, separators=(",", ":")))
+"""
+
+
+def clear_target_caches(target_ssh: str | None, unit: str) -> list[dict]:
+    environment = service_environment(target_ssh, unit)
+    config_path = environment.get("AENV_CONFIG_PATH", "/etc/agentenv/config.toml")
+    home_path = environment.get("AENV_HOME_PATH", "")
+    discovery = run_command(
+        host_command(
+            target_ssh,
+            ["python3", "-c", DISCOVER_TARGET_CACHE_SCRIPT, config_path, home_path],
+        )
+    )
+    if discovery.returncode != 0:
+        raise TestFailure(
+            "cannot resolve target cache paths from its active configuration: "
+            f"{discovery.stderr.strip() or discovery.stdout.strip()}"
+        )
+    try:
+        spec = json.loads(discovery.stdout)
+    except json.JSONDecodeError as error:
+        raise TestFailure(f"target cache discovery returned invalid JSON: {discovery.stdout!r}") from error
+
+    stopped = False
+    try:
+        stop = run_command(host_command(target_ssh, ["systemctl", "stop", unit]), timeout=60)
+        if stop.returncode != 0:
+            raise TestFailure(
+                f"cannot stop target service {unit!r} for cache cleanup: "
+                f"{stop.stderr.strip() or stop.stdout.strip()}"
+            )
+        stopped = True
+        cleared = run_command(
+            host_command(
+                target_ssh,
+                [
+                    "python3",
+                    "-c",
+                    CLEAR_TARGET_CACHE_SCRIPT,
+                    json.dumps(spec, separators=(",", ":")),
+                ],
+            ),
+            timeout=120,
+        )
+        if cleared.returncode != 0:
+            raise TestFailure(
+                "target cache cleanup failed: "
+                f"{cleared.stderr.strip() or cleared.stdout.strip()}"
+            )
+        try:
+            result = json.loads(cleared.stdout)
+        except json.JSONDecodeError as error:
+            raise TestFailure(f"target cache cleanup returned invalid JSON: {cleared.stdout!r}") from error
+    finally:
+        if stopped:
+            start = run_command(host_command(target_ssh, ["systemctl", "start", unit]), timeout=60)
+            if start.returncode != 0:
+                raise TestFailure(
+                    f"cannot restart target service {unit!r} after cache cleanup: "
+                    f"{start.stderr.strip() or start.stdout.strip()}"
+                )
+    ensure_service_active(target_ssh, unit, "target")
+    return result
 
 
 def journal_cursor(target_ssh: str | None, unit: str, label: str) -> str:
@@ -857,6 +1045,7 @@ def summarize_run(
         "target_node",
         "sandbox_resources",
         "workload",
+        "target_cache_cleanup",
         "creation_batch_duration_ms",
         "migration_batch_duration_ms",
         "post_migration_read_batch_duration_ms",
@@ -1118,6 +1307,11 @@ def main() -> int:
         "migrations": [],
         "post_migration_reads": [],
         "errors": [],
+        "target_cache_cleanup": {
+            "enabled": args.clear_target_cache,
+            "status": "pending" if args.clear_target_cache else "skipped",
+            "entries": [],
+        },
         "journal_scope": "preparation",
         "ublk_log_path": args.ublk_log_path,
     }
@@ -1128,6 +1322,29 @@ def main() -> int:
     try:
         for label, (target, unit) in hosts.items():
             ensure_service_active(target, unit, label)
+
+        if args.clear_target_cache:
+            print("[prepare] clearing target OverlayBD and Iroh caches", flush=True)
+            try:
+                entries = clear_target_caches(args.target_ssh, args.runtime_unit)
+            except Exception:
+                run_info["target_cache_cleanup"]["status"] = "failed"
+                write_run_info(run_info_path, run_info)
+                raise
+            run_info["target_cache_cleanup"] = {
+                "enabled": True,
+                "status": "succeeded",
+                "entries": entries,
+            }
+            write_run_info(run_info_path, run_info)
+            for entry in entries:
+                print(
+                    f"[prepare] cleared {entry['kind']}: {entry['path']} "
+                    f"({entry['removed_entries']} entries)",
+                    flush=True,
+                )
+
+        for label, (target, unit) in hosts.items():
             cursors[label] = journal_cursor(target, unit, label)
         for label in ("node-a", "node-b"):
             target, _ = hosts[label]

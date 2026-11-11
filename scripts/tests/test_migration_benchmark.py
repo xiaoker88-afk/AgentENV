@@ -456,6 +456,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(args.source_ssh, "local")
         self.assertEqual(args.target_ssh, "root@10.10.10.02")
         self.assertEqual(args.target_node, "node-b")
+        self.assertTrue(args.clear_target_cache)
         command = ["journalctl", "-u", "agentenv"]
         with mock.patch.object(os, "geteuid", return_value=0):
             self.assertEqual(bench.host_command(args.gateway_ssh, command), command)
@@ -463,6 +464,84 @@ class RunnerTests(unittest.TestCase):
         remote = bench.host_command(args.target_ssh, command)
         self.assertEqual(remote[0], "ssh")
         self.assertEqual(remote[-2], "root@10.10.10.02")
+
+    def test_target_cache_cleanup_uses_discovered_config_paths_and_restarts_runtime(self):
+        spec = {
+            "home": "/var/lib/aenv",
+            "targets": [
+                {"kind": "overlaybd_rootfs", "path": "/var/lib/aenv/cache/rootfs"},
+                {"kind": "overlaybd_memory", "path": "/var/lib/aenv/cache/memory"},
+                {"kind": "iroh_store", "path": "/var/lib/aenv/p2p/store/iroh"},
+            ],
+        }
+        cleared = [dict(entry, removed_entries=2) for entry in spec["targets"]]
+        results = [
+            subprocess.CompletedProcess([], 0, json.dumps(spec), ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, json.dumps(cleared), ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        with mock.patch.object(
+            bench,
+            "service_environment",
+            return_value={
+                "AENV_CONFIG_PATH": "/etc/agentenv/config.toml",
+                "AENV_HOME_PATH": "/var/lib/aenv",
+            },
+        ), mock.patch.object(bench, "run_command", side_effect=results) as runner, mock.patch.object(
+            bench, "ensure_service_active"
+        ) as active:
+            self.assertEqual(bench.clear_target_caches("root@b", "agentenv"), cleared)
+
+        commands = [call.args[0] for call in runner.call_args_list]
+        self.assertTrue(commands[1][-1].endswith("systemctl stop agentenv"))
+        self.assertTrue(commands[3][-1].endswith("systemctl start agentenv"))
+        self.assertIn("/var/lib/aenv/cache/rootfs", commands[2][-1])
+        active.assert_called_once_with("root@b", "agentenv", "target")
+
+    def test_target_cache_discovery_reads_configured_generated_json_paths(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = pathlib.Path(root)
+            home = root / "state"
+            generated = root / "generated"
+            generated.mkdir()
+            rootfs_json = generated / "rootfs.json"
+            memory_json = generated / "memory.json"
+            rootfs_json.write_text(
+                json.dumps({"cacheConfig": {"cacheDir": str(home / "root-cache")}})
+            )
+            memory_json.write_text(
+                json.dumps({"cacheConfig": {"cacheDir": str(home / "memory-cache")}})
+            )
+            config = root / "config.toml"
+            config.write_text(
+                f'''home_path = "{home}"
+[ublk.overlaybd]
+global_config_path = "{rootfs_json}"
+[memory_snapshot]
+overlaybd_global_config_path = "{memory_json}"
+[p2p]
+store_dir = "{home}/custom-p2p"
+'''
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", bench.DISCOVER_TARGET_CACHE_SCRIPT, str(config), ""],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        targets = {entry["kind"]: entry["path"] for entry in json.loads(result.stdout)["targets"]}
+        self.assertEqual(targets["overlaybd_rootfs"], str(home / "root-cache"))
+        self.assertEqual(targets["overlaybd_memory"], str(home / "memory-cache"))
+        self.assertEqual(targets["iroh_store"], str(home / "custom-p2p" / "iroh"))
+
+    def test_no_clear_target_cache_flag_disables_cleanup(self):
+        with mock.patch.object(
+            sys, "argv", [str(SCRIPT), "--no-clear-target-cache"]
+        ):
+            args = bench.parse_args()
+        self.assertFalse(args.clear_target_cache)
 
     def test_run_collects_three_hosts_after_creation_and_reports_failures(self):
         for fail_migration in (False, True):
@@ -521,6 +600,8 @@ class RunnerTests(unittest.TestCase):
                 with mock.patch.object(bench, "parse_args", return_value=args), mock.patch.dict(
                     os.environ, {"AENV_API_KEY": "do-not-persist-this"}
                 ), mock.patch.object(bench, "ensure_service_active"), mock.patch.object(
+                    bench, "clear_target_caches", return_value=[]
+                ) as cache_cleanup, mock.patch.object(
                     bench, "journal_cursor", side_effect=cursor
                 ), mock.patch.object(
                     bench, "create_sandbox", side_effect=create
@@ -538,6 +619,7 @@ class RunnerTests(unittest.TestCase):
                     bench.time, "sleep"
                 ):
                     self.assertEqual(bench.main(), 1 if fail_migration else 0)
+                cache_cleanup.assert_called_once_with("root@b", "agentenv")
                 run_dir = next(pathlib.Path(root).iterdir())
                 report = (run_dir / "migration-summary.log").read_text()
                 self.assertIn('"root@gw"', report)
