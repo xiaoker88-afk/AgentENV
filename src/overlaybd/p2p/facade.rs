@@ -11,6 +11,7 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use axum::routing::{get, post};
+use axum::serve::ListenerExt;
 use axum::Router;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -184,6 +185,13 @@ impl P2pHttpFacadeServer {
             .route(PUBLISH_LAYER_PATH, post(handle_publish_layer))
             .with_state(state);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        // Streamed range bodies may yield small chunks; send them promptly
+        // rather than waiting for acknowledgements of earlier TCP writes.
+        let listener = listener.tap_io(|stream| {
+            if let Err(err) = stream.set_nodelay(true) {
+                warn!(error = %err, "failed to enable TCP_NODELAY for p2p http connection");
+            }
+        });
         let task = tokio::spawn(async move {
             if let Err(err) = axum::serve(
                 listener,

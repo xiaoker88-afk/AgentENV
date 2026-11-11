@@ -71,6 +71,7 @@ python3 scripts/run-migration-test.py \
 - 新 server 输出 restore_begin、restore_prepare、restore_snapshot_load、restore_resume、restore_envd_wait、restore_ready_finalize、restore_launch_finalize；成功事件为阶段结束时间，缺失不代表零耗时。
 - Iroh 输出 range 下载（含 Downloader 排队和 store 处理）、导出准备、首块、末块和流被读完的计时。`iroh_export_last_chunk` 在累计产出请求长度时记录，并包含块数，不依赖消费者继续轮询 EOF；它表示数据产出，不代表 HTTP 已发送或客户端已接收。流被提前丢弃不会输出 drained；drained 不代表内容校验成功。
 - ublk 的 `p2p http range receive` 记录请求到响应头的 `headers_ms`、响应头到正文收齐的 `body_ms` 和总耗时，携带 URL、offset 供关联；失败仍由现有 fallback 日志记录。对比末块产出时间与客户端收齐时间，可以定位本地 HTTP 交付等待。这些明细保留在原始 ublk 日志，汇总报告继续使用外层 range 计时，避免重复计数。
+- P2P HTTP facade 对接受的 TCP 连接启用 `TCP_NODELAY`，避免小块流式正文受到 Nagle 缓冲影响。验证该改动只需更新 B 端 server，保留已包含接收计时的 ublk-daemon，并对比同条件下的正文接收耗时与 envd 等待耗时。
 - 块层按 on_demand/background_download 与 p2p/oss 分组；另按本节点首个/最后一个 envd 就绪边界统计。并发恢复期间标记 mixed_or_crossing，不把共享层强行归给某个 sandbox。无时间戳或旧 server 无 envd 边界时标记 unknown。累计读取量包含重读，吞吐基于操作耗时累计，不是网卡墙钟带宽。
 
 - 各端原始日志行数、字节数组消息数、有效阶段数；无法关联的 timing 数、缺失的迁移总耗时、解析错误、最多 30 条警告/错误证据。
