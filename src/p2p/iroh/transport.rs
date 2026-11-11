@@ -641,11 +641,24 @@ impl P2pTransport for IrohBlobsP2pTransport {
         let first_key = descriptor.key.clone();
         let final_key = descriptor.key.clone();
         let mut first = true;
-        let measured = stream.inspect(move |_| {
+        let mut delivered = 0usize;
+        let mut chunks = 0usize;
+        let measured = stream.inspect(move |item| {
+            let Ok(bytes) = item else {
+                return;
+            };
+            delivered += bytes.len();
+            chunks += 1;
             if first {
                 first = false;
                 info!(key = %first_key, offset, bytes = len,
                     stage = "iroh_export_first_chunk", status = "observed",
+                    duration_ms = delivery_started.elapsed().as_secs_f64() * 1000.0,
+                    "iroh stage timing");
+            }
+            if delivered == len {
+                info!(key = %first_key, offset, bytes = delivered, chunks,
+                    stage = "iroh_export_last_chunk", status = "observed",
                     duration_ms = delivery_started.elapsed().as_secs_f64() * 1000.0,
                     "iroh stage timing");
             }

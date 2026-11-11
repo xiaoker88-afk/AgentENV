@@ -30,6 +30,7 @@ impl VirtualFile for P2pRangeFile {
         }
         let count = len.min((self.size - offset) as usize);
         let end = offset + count as u64 - 1;
+        let started = Instant::now();
         let response = self
             .client
             .get(&self.url)
@@ -39,7 +40,18 @@ impl VirtualFile for P2pRangeFile {
         if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
             bail!("P2P range request returned status {}", response.status());
         }
+        let headers_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let body_started = Instant::now();
         let bytes = response.bytes().await?;
+        tracing::info!(
+            offset,
+            bytes = bytes.len(),
+            headers_ms,
+            body_ms = body_started.elapsed().as_secs_f64() * 1000.0,
+            duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+            url = %self.url,
+            "p2p http range receive"
+        );
         if bytes.len() != count {
             bail!(
                 "P2P range request returned {} bytes, expected {count}",
