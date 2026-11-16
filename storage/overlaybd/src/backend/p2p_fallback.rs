@@ -77,7 +77,6 @@ pub struct P2pFallbackFile {
     p2p: Arc<dyn VirtualFile>,
     fallback: Arc<dyn VirtualFile>,
     digest: String,
-    read_path: &'static str,
     size: u64,
 }
 
@@ -86,14 +85,12 @@ impl P2pFallbackFile {
         p2p: Arc<dyn VirtualFile>,
         fallback: Arc<dyn VirtualFile>,
         digest: String,
-        read_path: &'static str,
         size: u64,
     ) -> Self {
         Self {
             p2p,
             fallback,
             digest,
-            read_path,
             size,
         }
     }
@@ -111,7 +108,7 @@ impl VirtualFile for P2pFallbackFile {
                     bytes = bytes.len(),
                     duration_ms = started.elapsed().as_secs_f64() * 1000.0,
                     source = "p2p",
-                    read_path = self.read_path,
+                    read_path = "on_demand",
                     "overlaybd layer range read"
                 );
                 Ok(bytes)
@@ -122,7 +119,7 @@ impl VirtualFile for P2pFallbackFile {
                     offset,
                     bytes = len,
                     error = %error,
-                    read_path = self.read_path,
+                    read_path = "on_demand",
                     "overlaybd P2P layer range failed; falling back to OSS"
                 );
                 let fallback_started = Instant::now();
@@ -133,7 +130,7 @@ impl VirtualFile for P2pFallbackFile {
                     bytes = result.as_ref().map_or(0, Bytes::len),
                     duration_ms = fallback_started.elapsed().as_secs_f64() * 1000.0,
                     source = "oss",
-                    read_path = self.read_path,
+                    read_path = "on_demand",
                     status = if result.is_ok() { "ok" } else { "error" },
                     "overlaybd layer range read"
                 );
@@ -202,7 +199,6 @@ mod tests {
             p2p.clone(),
             fallback.clone(),
             "sha256:test".to_string(),
-            "on_demand",
             8,
         );
 
@@ -227,7 +223,6 @@ mod tests {
             p2p.clone(),
             fallback.clone(),
             "sha256:test".to_string(),
-            "background_download",
             8,
         );
 
