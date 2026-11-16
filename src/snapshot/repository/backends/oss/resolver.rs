@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
@@ -10,6 +11,7 @@ use tracing::debug;
 use super::client::OssClient;
 use super::layout::OssSnapshotArtifactLayout;
 use crate::image::cache::OverlaybdLayerStore;
+use crate::observability::migration_timing;
 use crate::p2p::P2pTransport;
 use crate::snapshot::artifact_cache::{CacheArtifactLease, CacheHandle, LocalArtifactCache};
 use crate::snapshot::p2p;
@@ -99,6 +101,12 @@ impl OssRuntimeResolver {
 impl SnapshotRuntimeResolver for OssRuntimeResolver {
     async fn resolve(&self, snapshot: Arc<SnapshotRecord>) -> RepositoryResult<RunnableSnapshot> {
         let id = snapshot.id.clone();
+        let source_sandbox_id = match &snapshot.source {
+            crate::snapshot::SnapshotSource::Sandbox { source_sandbox_id } => {
+                Some(source_sandbox_id.clone())
+            }
+            crate::snapshot::SnapshotSource::Template { .. } => None,
+        };
         let committed =
             snapshot
                 .committed
@@ -114,6 +122,8 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
         let vm_state_client = Arc::clone(&self.client);
         let p2p_transport = self.p2p_transport.clone();
         let vm_state_p2p_key = p2p::fixed_artifact_key(&id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
+        let snapshot_id = id.to_string();
+        let vm_state_sandbox_id = source_sandbox_id.clone();
         let vm_state_handle = self
             .cache
             .ensure_cached(&vm_state_key, |dest| {
@@ -121,9 +131,23 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
                 let key = vm_state_key.clone();
                 let p2p_transport = p2p_transport.clone();
                 let p2p_key = vm_state_p2p_key.clone();
+                let snapshot_id = snapshot_id.clone();
+                let sandbox_id = vm_state_sandbox_id.clone();
                 async move {
                     if let Some(transport) = p2p_transport.as_ref() {
-                        match p2p::fetch_artifact(transport, &p2p_key, &dest).await {
+                        let started = Instant::now();
+                        let fetched = p2p::fetch_artifact(transport, &p2p_key, &dest).await;
+                        migration_timing::log_stage(
+                            "snapshot_vm_state_fetch",
+                            started.elapsed(),
+                            if fetched.is_ok() { "ok" } else { "miss_or_error" },
+                            sandbox_id.as_deref(),
+                            Some(&snapshot_id),
+                            Some("oss"),
+                            Some("p2p"),
+                            fetched.as_ref().ok().copied(),
+                        );
+                        match fetched {
                             Ok(size) => return Ok(size),
                             Err(error) => {
                                 debug!(
@@ -134,7 +158,19 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
                             }
                         }
                     }
-                    client.get_to_file(&key, &dest).await
+                    let started = Instant::now();
+                    let fetched = client.get_to_file(&key, &dest).await;
+                    migration_timing::log_stage(
+                        "snapshot_vm_state_fetch",
+                        started.elapsed(),
+                        if fetched.is_ok() { "ok" } else { "error" },
+                        sandbox_id.as_deref(),
+                        Some(&snapshot_id),
+                        Some("oss"),
+                        Some("oss"),
+                        fetched.as_ref().ok().copied(),
+                    );
+                    fetched
                 }
             })
             .await
@@ -146,7 +182,11 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
 
         // ── firecracker manifest ───────────────────────────────────
         let committed_manifest = self
-            .load_committed_firecracker_manifest(&layout, &id)
+            .load_committed_firecracker_manifest(
+                &layout,
+                &id,
+                source_sandbox_id.as_deref(),
+            )
             .await?;
 
         // ── memory image config ────────────────────────────────────
@@ -381,11 +421,25 @@ impl OssRuntimeResolver {
         &self,
         layout: &OssSnapshotArtifactLayout<'_>,
         snapshot_id: &SnapshotId,
+        sandbox_id: Option<&str>,
     ) -> RepositoryResult<crate::sandbox::SandboxSnapshotManifest> {
+        let snapshot_id_text = snapshot_id.to_string();
         let p2p_key =
             p2p::fixed_artifact_key(snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
         if let Some(transport) = self.p2p_transport.as_ref() {
-            match p2p::fetch_artifact_bytes(transport, &p2p_key).await {
+            let started = Instant::now();
+            let fetched = p2p::fetch_artifact_bytes(transport, &p2p_key).await;
+            migration_timing::log_stage(
+                "snapshot_manifest_fetch",
+                started.elapsed(),
+                if fetched.is_ok() { "ok" } else { "miss_or_error" },
+                sandbox_id,
+                Some(&snapshot_id_text),
+                Some("oss"),
+                Some("p2p"),
+                fetched.as_ref().ok().map(|bytes| bytes.len() as u64),
+            );
+            match fetched {
                 Ok(bytes) => match parse_firecracker_manifest(&bytes, &p2p_key) {
                     Ok(manifest) => return Ok(manifest),
                     Err(error) => {
@@ -407,7 +461,19 @@ impl OssRuntimeResolver {
         }
 
         let key = layout.artifact_key(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
-        let bytes = self.client.get_bytes(&key).await.map_err(|error| {
+        let started = Instant::now();
+        let bytes = self.client.get_bytes(&key).await;
+        migration_timing::log_stage(
+            "snapshot_manifest_fetch",
+            started.elapsed(),
+            if bytes.is_ok() { "ok" } else { "error" },
+            sandbox_id,
+            Some(&snapshot_id_text),
+            Some("oss"),
+            Some("oss"),
+            bytes.as_ref().ok().map(|bytes| bytes.len() as u64),
+        );
+        let bytes = bytes.map_err(|error| {
             if OssClient::is_not_found_error(&error) {
                 return RepositoryError::ArtifactNotFound {
                     artifact: format!(

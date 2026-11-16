@@ -11,6 +11,7 @@
 //! sandboxes on every call.
 
 mod host;
+pub(crate) mod migration_timing;
 mod machine;
 mod model;
 pub mod prometheus;

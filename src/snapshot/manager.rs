@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use futures::{stream, StreamExt};
@@ -7,6 +8,7 @@ use tracing::warn;
 
 use super::p2p::SnapshotP2pArtifact;
 use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
+use crate::observability::migration_timing;
 use crate::p2p::P2pTransport;
 use crate::sandbox::{
     CapturedSandboxSnapshot, FirecrackerCaptureArtifacts, SandboxSnapshotManifest,
@@ -129,6 +131,20 @@ impl SnapshotManager {
         metadata: SnapshotPublishMetadata,
         captured_snapshot: CapturedSandboxSnapshot,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+        let snapshot_id = metadata.id.to_string();
+        let source_sandbox_id = match &metadata.source {
+            crate::snapshot::SnapshotPublishSource::Sandbox { source_sandbox_id } => {
+                Some(source_sandbox_id.clone())
+            }
+            crate::snapshot::SnapshotPublishSource::Template => None,
+        };
+        let backend = match crate::cfg::ConfigManager::global_config()
+            .snapshot
+            .repository_backend
+        {
+            crate::cfg::SnapshotRepositoryBackendKind::PosixFs => "posix_fs",
+            crate::cfg::SnapshotRepositoryBackendKind::Oss => "oss",
+        };
         let manifest = captured_snapshot.manifest().clone();
 
         // Spawn the startup-manifest recording up front (a no-op task when
@@ -148,11 +164,37 @@ impl SnapshotManager {
                 )
             });
 
+        let repository_started = Instant::now();
         let publication = self
             .repository
             .publish_with_local_layers(metadata, manifest.clone(), recording)
-            .await?;
-        self.publish_p2p_artifacts(&publication, &manifest).await;
+            .await;
+        migration_timing::log_stage(
+            "snapshot_repository_publish",
+            repository_started.elapsed(),
+            if publication.is_ok() { "ok" } else { "error" },
+            source_sandbox_id.as_deref(),
+            Some(&snapshot_id),
+            Some(backend),
+            Some(backend),
+            None,
+        );
+        let publication = publication?;
+
+        if self.p2p_transport.is_some() {
+            let p2p_started = Instant::now();
+            self.publish_p2p_artifacts(&publication, &manifest).await;
+            migration_timing::log_stage(
+                "snapshot_p2p_publish",
+                p2p_started.elapsed(),
+                "completed_best_effort",
+                source_sandbox_id.as_deref(),
+                Some(&snapshot_id),
+                Some(backend),
+                Some("p2p"),
+                None,
+            );
+        }
         Ok(publication.record)
     }
 
@@ -318,10 +360,49 @@ impl SnapshotManager {
         &self,
         id_or_alias: impl AsRef<str>,
     ) -> anyhow::Result<Option<RunnableSnapshot>> {
-        let Some(snapshot) = self.get(id_or_alias.as_ref()).await? else {
+        let snapshot_ref = id_or_alias.as_ref().to_string();
+        let backend = match crate::cfg::ConfigManager::global_config()
+            .snapshot
+            .repository_backend
+        {
+            crate::cfg::SnapshotRepositoryBackendKind::PosixFs => "posix_fs",
+            crate::cfg::SnapshotRepositoryBackendKind::Oss => "oss",
+        };
+        let load_started = Instant::now();
+        let loaded = self.get(&snapshot_ref).await;
+        migration_timing::log_stage(
+            "snapshot_record_load",
+            load_started.elapsed(),
+            if loaded.is_ok() { "ok" } else { "error" },
+            None,
+            Some(&snapshot_ref),
+            Some(backend),
+            Some(backend),
+            None,
+        );
+        let Some(snapshot) = loaded? else {
             return Ok(None);
         };
-        self.resolve_runnable(snapshot).await.map(Some)
+        let snapshot_id = snapshot.id.to_string();
+        let source_sandbox_id = match &snapshot.source {
+            crate::snapshot::SnapshotSource::Sandbox { source_sandbox_id } => {
+                Some(source_sandbox_id.clone())
+            }
+            crate::snapshot::SnapshotSource::Template { .. } => None,
+        };
+        let resolve_started = Instant::now();
+        let resolved = self.resolve_runnable(snapshot).await;
+        migration_timing::log_stage(
+            "snapshot_runtime_resolve",
+            resolve_started.elapsed(),
+            if resolved.is_ok() { "ok" } else { "error" },
+            source_sandbox_id.as_deref(),
+            Some(&snapshot_id),
+            Some(backend),
+            None,
+            None,
+        );
+        resolved.map(Some)
     }
 
     /// Atomically transitions one template build from waiting to building.

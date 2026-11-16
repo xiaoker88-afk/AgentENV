@@ -24,7 +24,7 @@ use dashmap::DashMap;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
@@ -70,6 +70,7 @@ impl BkDownloadSubmitError {
 struct BkDownloadTask {
     cache_id: String,
     cache_key: String,
+    source_kind: &'static str,
     source: Arc<dyn VirtualFile>,
     source_size: u64,
     config: DownloadConfig,
@@ -275,6 +276,7 @@ impl BkDownloadScheduler {
             let blocks_per_chunk = u32::try_from(blocks_per_chunk).unwrap_or(u32::MAX).max(1);
             let task = Arc::new(BkDownloadTask {
                 cache_id: cache_id.clone(),
+                source_kind: remote_source_kind(&cache_key),
                 cache_key,
                 source,
                 source_size,
@@ -900,6 +902,7 @@ async fn download_chunks(
             };
             let file = file.clone();
             let source = task.source.clone();
+            let source_kind = task.source_kind;
             let source_size = task.source_size;
             let running = scheduler.running.clone();
             let block_slots = scheduler.block_slots.clone();
@@ -909,6 +912,7 @@ async fn download_chunks(
                 let read = refill_chunk_with_hedge(
                     &file,
                     &source,
+                    source_kind,
                     source_size,
                     (start_block, len_blocks),
                     &running,
@@ -945,6 +949,7 @@ async fn download_chunks(
 async fn refill_chunk_with_hedge(
     file: &Arc<CachedFile>,
     source: &Arc<dyn VirtualFile>,
+    source_kind: &'static str,
     source_size: u64,
     chunk: (u64, u32),
     running: &AtomicBool,
@@ -966,11 +971,27 @@ async fn refill_chunk_with_hedge(
             let Some(_gate) = crate::download_gate::gate_block_read(running).await else {
                 bail!("background cache download canceled before chunk dispatch");
             };
-            tokio::time::timeout(
+            let started = Instant::now();
+            let result = tokio::time::timeout(
                 hedge_timeout,
                 file.background_refill_range(source, source_size, start_block, len_blocks),
             )
-            .await
+            .await;
+            let (status, bytes) = match &result {
+                Ok(Ok(bytes)) => ("ok", *bytes),
+                Ok(Err(_)) | Err(_) => ("error", 0),
+            };
+            tracing::info!(
+                start_block,
+                blocks = len_blocks,
+                bytes,
+                duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+                source = source_kind,
+                read_path = "background_download",
+                status,
+                "overlaybd layer range read"
+            );
+            result
             // Gate permit and block slot are released here, before any hedge
             // backoff sleep.
         };
@@ -990,6 +1011,14 @@ async fn refill_chunk_with_hedge(
             }
             Err(elapsed) => return Err(elapsed.into()),
         }
+    }
+}
+
+fn remote_source_kind(cache_key: &str) -> &'static str {
+    match cache_key.split_once("://").map(|(scheme, _)| scheme) {
+        Some("s3" | "oss") => "oss",
+        Some("http" | "https") => "registry",
+        _ => "origin",
     }
 }
 
@@ -1085,5 +1114,13 @@ mod tests {
         assert_eq!(queue.pop(), Some(4));
         assert_eq!(queue.pop(), Some(2));
         assert_eq!(queue.pop(), None);
+    }
+
+    #[test]
+    fn classifies_background_download_sources_without_logging_urls() {
+        assert_eq!(remote_source_kind("s3://bucket/layer"), "oss");
+        assert_eq!(remote_source_kind("oss://bucket/layer"), "oss");
+        assert_eq!(remote_source_kind("https://registry.example/layer"), "registry");
+        assert_eq!(remote_source_kind("local-layer"), "origin");
     }
 }
