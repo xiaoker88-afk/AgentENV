@@ -32,7 +32,7 @@ use super::URMA_BACKEND_ID;
 use crate::p2p::config::ResolvedP2pConfig;
 use crate::p2p::discovery::P2pPeerDiscovery;
 use crate::p2p::error::{Error, Result};
-use crate::p2p::transport::P2pTransport;
+use crate::p2p::transport::{P2pTransport, PreparedP2pPublication};
 use crate::p2p::types::{
     P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProvider, P2pArtifactProviderHint,
     P2pEndpoint, P2pFetchOptions, P2pPeer, P2pPublishMode, P2pPublishRequest, P2pPublishSource,
@@ -75,6 +75,44 @@ impl LocalArtifact {
                 metadata
             }
         }
+    }
+}
+
+// Fields drop in declaration order: unregister before unmapping the file.
+struct PreparedUrmaPublication {
+    segment: super::segment::PreparedSegment,
+    artifact: LocalArtifact,
+    key: String,
+    registry: Arc<SegmentRegistry>,
+    local_artifacts: Arc<Mutex<HashMap<String, LocalArtifact>>>,
+    discovery: Arc<dyn P2pPeerDiscovery>,
+}
+
+#[async_trait]
+impl PreparedP2pPublication for PreparedUrmaPublication {
+    async fn publish(self: Box<Self>) -> Result<()> {
+        let Self {
+            segment,
+            artifact,
+            key,
+            registry,
+            local_artifacts,
+            discovery,
+        } = *self;
+        {
+            let mut artifacts = local_artifacts.lock().unwrap();
+            if artifacts.contains_key(&key) && registry.locator(&key).is_some() {
+                drop(segment);
+                drop(artifact);
+            } else {
+                registry.activate(segment);
+                artifacts.insert(key.clone(), artifact);
+            }
+        }
+        if let Err(err) = discovery.record_key(&key).await {
+            warn!(error = %err, "urma: failed to record artifact in discovery");
+        }
+        Ok(())
     }
 }
 
@@ -762,6 +800,50 @@ impl P2pTransport for UrmaP2pTransport {
         result
     }
 
+    async fn prepare_publish(
+        &self,
+        request: &P2pPublishRequest,
+    ) -> Result<Option<Box<dyn PreparedP2pPublication>>> {
+        let P2pPublishSource::Path(path) = &request.source else {
+            return Ok(None);
+        };
+        if self.registry.locator(&request.key).is_some()
+            && self
+                .local_artifacts
+                .lock()
+                .unwrap()
+                .contains_key(&request.key)
+        {
+            return Ok(None);
+        }
+        let path = path.clone();
+        let key = request.key.clone();
+        let metadata = request.metadata.clone();
+        let registry = self.registry.clone();
+        let local_artifacts = self.local_artifacts.clone();
+        let discovery = self.peer_discovery.clone();
+        // Segment registration is synchronous and can take hundreds of
+        // milliseconds. Keep it off the executor while OSS uploads proceed.
+        tokio::task::spawn_blocking(move || {
+            let map = file_map::FileMap::map(&path)?;
+            let segment = registry.prepare(&key, map.addr, map.len as u64)?;
+            Ok(Some(Box::new(PreparedUrmaPublication {
+                segment,
+                artifact: LocalArtifact::Reference {
+                    path,
+                    map,
+                    metadata,
+                },
+                key,
+                registry,
+                local_artifacts,
+                discovery,
+            }) as Box<dyn PreparedP2pPublication>))
+        })
+        .await
+        .map_err(|err| Error::internal_message("prepare URMA publication task", err))?
+    }
+
     #[instrument(skip(self, request), fields(key = %request.key, source = %request.source))]
     async fn publish(&self, request: &P2pPublishRequest) -> Result<()> {
         // For file-path sources, always try mmap first: mmap returns a
@@ -907,6 +989,27 @@ mod tests {
             backend_locator: Some(locator.encode()),
             metadata: serde_json::Value::Null,
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_file_stays_private_until_publish() {
+        let ops = MockUrmaOps::new();
+        let transport = transport(ops.clone());
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("layer");
+        std::fs::write(&path, b"prepared layer").unwrap();
+        let key = "prepared".to_string();
+        let request = P2pPublishRequest::file(key.clone(), path);
+
+        let prepared = transport.prepare_publish(&request).await.unwrap().unwrap();
+        assert!(transport.registry.locator(&key).is_none());
+        assert!(!transport.local_artifacts.lock().unwrap().contains_key(&key));
+        let registrations = ops.status.lock().unwrap().registered.len();
+        prepared.publish().await.unwrap();
+
+        assert!(transport.registry.locator(&key).is_some());
+        assert_eq!(ops.status.lock().unwrap().registered.len(), registrations);
+        transport.shutdown().await.unwrap();
     }
 
     #[tokio::test]

@@ -195,8 +195,55 @@ impl SnapshotP2pArtifact {
             .collect()
     }
 
-    pub(crate) async fn publish(&self, transport: &Arc<dyn P2pTransport>) -> Result<()> {
-        let request = match &self.source {
+    /// Candidates only: final publication still checks committed identities.
+    pub(crate) fn prepare_candidates(
+        snapshot_id: &SnapshotId,
+        manifest: &crate::sandbox::SandboxSnapshotManifest,
+    ) -> Vec<Self> {
+        let mut artifacts = vec![Self::fixed(
+            snapshot_id,
+            crate::snapshot::types::SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
+            manifest.vm_state.path.clone(),
+        )];
+        for path in std::iter::once(&manifest.rootfs.image_config_path)
+            .chain(std::iter::once(&manifest.memory.image_config_path))
+            .chain(
+                manifest
+                    .attached_drives
+                    .iter()
+                    .map(|drive| &drive.image_config_path),
+            )
+        {
+            if let Ok(config) = load_overlaybd_image_config(path) {
+                let digests = config
+                    .lowers
+                    .iter()
+                    .map(|layer| layer.digest.clone())
+                    .collect();
+                artifacts.extend(Self::local_overlaybd_layers(
+                    path,
+                    &digests,
+                    &HashSet::new(),
+                ));
+            }
+        }
+        let mut keys = HashSet::new();
+        artifacts.retain(|artifact| keys.insert(artifact.key.clone()));
+        artifacts
+    }
+
+    pub(crate) async fn prepare(
+        &self,
+        transport: &Arc<dyn P2pTransport>,
+    ) -> Result<Option<Box<dyn crate::p2p::PreparedP2pPublication>>> {
+        transport
+            .prepare_publish(&self.request())
+            .await
+            .map_err(Into::into)
+    }
+
+    fn request(&self) -> P2pPublishRequest {
+        match &self.source {
             P2pPublishSource::Path(source) => {
                 P2pPublishRequest::file(self.key.clone(), source.clone())
                     .with_publish_mode(self.publish_mode)
@@ -205,7 +252,11 @@ impl SnapshotP2pArtifact {
                 P2pPublishRequest::bytes(self.key.clone(), bytes.clone())
             }
         }
-        .with_metadata(self.metadata.clone());
+        .with_metadata(self.metadata.clone())
+    }
+
+    pub(crate) async fn publish(&self, transport: &Arc<dyn P2pTransport>) -> Result<()> {
+        let request = self.request();
 
         transport
             .publish(&request)

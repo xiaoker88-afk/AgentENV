@@ -121,7 +121,8 @@ impl SnapshotManager {
             .repository
             .publish_with_local_layers(metadata, manifest.clone(), recording)
             .await?;
-        self.publish_p2p_artifacts(&publication, &manifest).await;
+        self.publish_p2p_artifacts(&publication, &manifest, Vec::new())
+            .await;
         Ok(publication.record)
     }
 
@@ -164,26 +165,72 @@ impl SnapshotManager {
                 )
             });
 
-        let repository_started = Instant::now();
-        let publication = self
-            .repository
-            .publish_with_local_layers(metadata, manifest.clone(), recording)
+        let prepare_id = metadata.id.clone();
+        let prepare = async {
+            if backend != "oss" {
+                return Vec::new();
+            }
+            let Some(transport) = self.p2p_transport.as_ref() else {
+                return Vec::new();
+            };
+            let started = Instant::now();
+            let prepared = stream::iter(SnapshotP2pArtifact::prepare_candidates(
+                &prepare_id,
+                &manifest,
+            ))
+            .map(|artifact| async move {
+                match artifact.prepare(transport).await {
+                    Ok(Some(prepared)) => Some((artifact, prepared)),
+                    Ok(None) => None,
+                    Err(error) => {
+                        warn!(key = %artifact.key, error = %error, "snapshot P2P preparation failed; retrying after commit");
+                        None
+                    }
+                }
+            })
+            .buffer_unordered(SNAPSHOT_P2P_PUBLISH_CONCURRENCY)
+            .filter_map(futures::future::ready)
+            .collect::<Vec<_>>()
             .await;
-        migration_timing::log_stage(
-            "snapshot_repository_publish",
-            repository_started.elapsed(),
-            if publication.is_ok() { "ok" } else { "error" },
-            source_sandbox_id.as_deref(),
-            Some(&snapshot_id),
-            Some(backend),
-            Some(backend),
-            None,
-        );
+            migration_timing::log_stage(
+                "snapshot_p2p_prepare",
+                started.elapsed(),
+                "completed_best_effort",
+                source_sandbox_id.as_deref(),
+                Some(&snapshot_id),
+                Some(backend),
+                Some("p2p"),
+                None,
+            );
+            prepared
+        };
+        let publish_repository = async {
+            let repository_started = Instant::now();
+            let publication = self
+                .repository
+                .publish_with_local_layers(metadata, manifest.clone(), recording)
+                .await;
+            migration_timing::log_stage(
+                "snapshot_repository_publish",
+                repository_started.elapsed(),
+                if publication.is_ok() { "ok" } else { "error" },
+                source_sandbox_id.as_deref(),
+                Some(&snapshot_id),
+                Some(backend),
+                Some(backend),
+                None,
+            );
+            publication
+        };
+        // Preparation owns only private resources. Artifacts become visible
+        // after the durable repository commit succeeds.
+        let (publication, prepared) = tokio::join!(publish_repository, prepare);
         let publication = publication?;
 
         if self.p2p_transport.is_some() {
             let p2p_started = Instant::now();
-            self.publish_p2p_artifacts(&publication, &manifest).await;
+            self.publish_p2p_artifacts(&publication, &manifest, prepared)
+                .await;
             migration_timing::log_stage(
                 "snapshot_p2p_publish",
                 p2p_started.elapsed(),
@@ -199,11 +246,15 @@ impl SnapshotManager {
     }
 
     /// Best effort attempt to publish snapshot artifacts to P2P.
-    #[tracing::instrument(skip(self, publication, manifest), fields(snapshot_id = %publication.record.id))]
+    #[tracing::instrument(skip(self, publication, manifest, prepared), fields(snapshot_id = %publication.record.id))]
     async fn publish_p2p_artifacts(
         &self,
         publication: &SnapshotPublication,
         manifest: &SandboxSnapshotManifest,
+        mut prepared: Vec<(
+            SnapshotP2pArtifact,
+            Box<dyn crate::p2p::PreparedP2pPublication>,
+        )>,
     ) {
         let Some(transport) = self.p2p_transport.as_ref() else {
             return;
@@ -279,17 +330,37 @@ impl SnapshotManager {
         artifacts.retain(|artifact| keys.insert(artifact.key.clone()));
 
         // Publish all artifacts concurrently, but don't fail if any individual artifact fails to publish.
-        stream::iter(artifacts)
-            .for_each_concurrent(SNAPSHOT_P2P_PUBLISH_CONCURRENCY, |artifact| async move {
-                if let Err(error) = artifact.publish(transport).await {
-                    warn!(
-                        key = %artifact.key,
-                        source = %artifact.source,
-                        error = %error,
-                        "failed to publish snapshot artifact to P2P"
-                    );
-                }
+        let publications = artifacts
+            .into_iter()
+            .map(|artifact| {
+                let ready = prepared
+                    .iter()
+                    .position(|(candidate, _)| candidate == &artifact)
+                    .map(|index| prepared.swap_remove(index).1);
+                (artifact, ready)
             })
+            .collect::<Vec<_>>();
+        drop(prepared);
+        stream::iter(publications)
+            .for_each_concurrent(
+                SNAPSHOT_P2P_PUBLISH_CONCURRENCY,
+                |(artifact, prepared)| async move {
+                    let result = match prepared {
+                        Some(prepared) => {
+                            prepared.publish().await.map_err(anyhow::Error::from)
+                        }
+                        None => artifact.publish(transport).await,
+                    };
+                    if let Err(error) = result {
+                        warn!(
+                            key = %artifact.key,
+                            source = %artifact.source,
+                            error = %error,
+                            "failed to publish snapshot artifact to P2P"
+                        );
+                    }
+                },
+            )
             .await;
     }
 
@@ -459,6 +530,74 @@ mod tests {
             .publish(metadata, manifest, None)
             .await
             .expect("seed publish should work");
+    }
+
+    struct PreparedProbe {
+        published: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for PreparedProbe {
+        fn drop(&mut self) {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::p2p::PreparedP2pPublication for PreparedProbe {
+        async fn publish(self: Box<Self>) -> crate::p2p::P2pResult<()> {
+            self.published
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_publications_require_committed_matching_sources() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let workspace = TempDir::new().unwrap();
+        let mut manager = test_manager(workspace.path());
+        manager.p2p_transport = Some(Arc::new(MockTransport::default()));
+        let (_, _, manifest) =
+            write_mock_built_artifacts(&workspace.path().join("artifacts")).unwrap();
+        let publication = manager
+            .repository
+            .publish_with_local_layers(SnapshotPublishMetadata::mock(), manifest.clone(), None)
+            .await
+            .unwrap();
+        let matching = SnapshotP2pArtifact::fixed(
+            &publication.record.id,
+            SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
+            manifest.vm_state.path.clone(),
+        );
+        let changed_source = SnapshotP2pArtifact::fixed(
+            &publication.record.id,
+            SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
+            workspace.path().join("different"),
+        );
+        let published = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let prepared = [matching, changed_source]
+            .into_iter()
+            .map(|artifact| {
+                (
+                    artifact,
+                    Box::new(PreparedProbe {
+                        published: published.clone(),
+                        dropped: dropped.clone(),
+                    }) as Box<dyn crate::p2p::PreparedP2pPublication>,
+                )
+            })
+            .collect();
+
+        manager
+            .publish_p2p_artifacts(&publication, &manifest, prepared)
+            .await;
+
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
