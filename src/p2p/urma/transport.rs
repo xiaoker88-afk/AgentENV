@@ -413,7 +413,7 @@ impl UrmaP2pTransport {
             context.clone(),
             connections.clone(),
             config.lookup_timeout,
-        ));
+        )?);
 
         info!(
             node_id = %node_id,

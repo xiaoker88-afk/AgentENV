@@ -42,6 +42,10 @@ use crate::p2p::types::{P2pArtifactDescriptor, P2pArtifactKey, P2pPeer};
 /// Fixed size of catalog control buffers (registered segments).
 pub const CATALOG_BUF_SIZE: usize = 4096;
 
+/// One catalog query needs one SEND and one RECV buffer. Pre-register one
+/// pair so the first query does not pay segment registration latency.
+const CLIENT_BUFFER_POOL_SIZE: usize = 2;
+
 /// Catalog query request body.
 #[derive(Serialize, Deserialize)]
 pub struct CatalogRequest {
@@ -234,13 +238,16 @@ impl UrmaCatalog {
         context: Arc<UrmaContext>,
         connections: Arc<PeerConnectionManager>,
         timeout: Duration,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let pool = (0..CLIENT_BUFFER_POOL_SIZE)
+            .map(|_| ControlBuffer::new(&context))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
             context,
             connections,
-            pool: tokio::sync::Mutex::new(Vec::new()),
+            pool: tokio::sync::Mutex::new(pool),
             timeout,
-        }
+        })
     }
 
     async fn lease(&self) -> Result<ControlBuffer> {
@@ -696,6 +703,27 @@ async fn handle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn catalog_client_preregisters_first_query_buffers() {
+        let ops = super::super::ops::MockUrmaOps::new();
+        let context = Arc::new(UrmaContext::mock(ops.clone()).unwrap());
+        let connections = Arc::new(PeerConnectionManager::new(
+            context.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(3600),
+        ));
+
+        let catalog = UrmaCatalog::new(context, connections, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(catalog.pool.lock().await.len(), CLIENT_BUFFER_POOL_SIZE);
+        let status = ops.status.lock().unwrap();
+        assert_eq!(status.registered.len(), CLIENT_BUFFER_POOL_SIZE);
+        assert!(status
+            .registered
+            .iter()
+            .all(|(_, len)| *len == CATALOG_BUF_SIZE as u64));
+    }
 
     #[test]
     fn jetty_id_address_roundtrip() {
