@@ -1,92 +1,162 @@
-//! Manual P2P fetch tool: lookup + fetch an artifact over the configured
-//! P2P transport (URMA), timing each stage and printing the full error
-//! chain on failure.
+//! Standalone P2P artifact smoke-test and micro-benchmark tool.
 //!
-//! Usage:
-//!   p2p-fetch <key> [dest]            lookup + fetch (stages timed)
-//!   p2p-fetch --serve <file> <key>    publish <file> under <key> and serve
-//!                                     until killed (prints endpoint)
-//!
-//! Examples:
-//!   p2p-fetch snapshot/v1/artifacts/<snapshot-id>/vm_state.bin /tmp/vm_state.bin
-//!   p2p-fetch overlaybd-layer/v1/uuid/<uuid> /tmp/layer.bin
-//!   p2p-fetch --serve /tmp/payload.bin p2p-test/v1/payload
+//! All operations go through the same `P2pTransport` abstraction used by the
+//! AgentENV server. The benchmark consumes a byte-range stream without writing
+//! it to disk, so destination storage does not dominate transport throughput.
 
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use agentenv::identity::NodeIdentity;
-use agentenv::p2p::{transport_from_config, P2pArtifactProvider, P2pPublishRequest, P2pTransport};
+use agentenv::p2p::{
+    transport_from_config, P2pArtifactProvider, P2pArtifactProviderHint, P2pEndpoint,
+    P2pPublishRequest, P2pTransport,
+};
+use anyhow::{bail, Context};
+use futures::StreamExt;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Debug-level logs for the p2p path so every URMA stage is visible.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,agentenv::p2p=debug".into()),
-        )
-        .init();
+#[derive(Debug)]
+enum Command {
+    Serve {
+        file: PathBuf,
+        key: String,
+    },
+    Fetch {
+        key: String,
+        destination: PathBuf,
+    },
+    Benchmark {
+        key: String,
+        peer: String,
+        offset: u64,
+        bytes: usize,
+        expected_sha256: Option<String>,
+        result: PathBuf,
+    },
+}
 
-    let args: Vec<String> = std::env::args().collect();
-    let t0 = Instant::now();
-    let config_manager = agentenv::cfg::ConfigManager::init_global()?;
-    let config = config_manager.config();
-    let identity = NodeIdentity::from_config(&config.node_identity);
-    let transport = transport_from_config(config, &identity).await?;
-    println!("[stage 0] transport init: {:?}", t0.elapsed());
-    let local_endpoint = transport
-        .local_endpoint()
-        .map(|e| e.address)
-        .unwrap_or_default();
-    println!("[stage 0] local endpoint: {local_endpoint}");
+#[derive(Serialize)]
+struct BenchmarkResult {
+    schema: &'static str,
+    timestamp: String,
+    transport: String,
+    local_endpoint: String,
+    peer_endpoint: String,
+    key: String,
+    offset: u64,
+    requested_bytes: usize,
+    received_bytes: usize,
+    transport_init_ms: f64,
+    lookup_ms: f64,
+    stream_prepare_ms: f64,
+    first_byte_ms: f64,
+    transfer_ms: f64,
+    throughput_mib_s: f64,
+    sha256: Option<String>,
+    sha256_verified: Option<bool>,
+}
 
-    if args.len() >= 4 && args[1] == "--serve" {
-        let file = &args[2];
-        let key = args[3].clone();
-        let request = P2pPublishRequest::file(key.clone(), file.clone());
-        transport.publish(&request).await?;
-        println!("[serve] published {file} as {key}");
-        println!("[serve] endpoint for peers: {local_endpoint}");
-        println!("[serve] serving until killed...");
-        tokio::signal::ctrl_c().await?;
-        return Ok(());
-    }
+fn usage() -> &'static str {
+    "usage:\n  p2p-fetch --serve <file> <key>\n  p2p-fetch <key> [destination]\n  p2p-fetch --benchmark <key> --peer <endpoint> --bytes <count> [--offset <count>] [--sha256 <hex>] [--result <path>]"
+}
 
-    if args.len() < 2 {
-        anyhow::bail!("usage: p2p-fetch <key> [dest] | p2p-fetch --serve <file> <key>");
-    }
-    let key = args[1].clone();
-    let dest = args
-        .get(2)
-        .cloned()
-        .unwrap_or_else(|| "/tmp/p2p-fetch.out".to_string());
+fn parse_u64(name: &str, raw: &str) -> anyhow::Result<u64> {
+    raw.parse::<u64>()
+        .with_context(|| format!("invalid {name} value '{raw}'"))
+}
 
-    // Stage 1: lookup
-    let t1 = Instant::now();
-    let descriptor = match transport.lookup(&key).await {
-        Ok(Some(d)) => {
-            println!("[stage 1] lookup: OK {:?}", t1.elapsed());
-            d
-        }
-        Ok(None) => {
-            println!("[stage 1] lookup: NOT FOUND {:?}", t1.elapsed());
-            return Ok(());
-        }
-        Err(e) => {
-            println!("[stage 1] lookup: FAILED {:?}\nerror: {:#}", t1.elapsed(), e);
-            return Ok(());
-        }
+fn option_value(args: &[String], name: &str) -> anyhow::Result<Option<String>> {
+    let Some(index) = args.iter().position(|arg| arg == name) else {
+        return Ok(None);
     };
+    let value = args
+        .get(index + 1)
+        .with_context(|| format!("missing value after {name}"))?;
+    Ok(Some(value.clone()))
+}
+
+fn parse_command(args: &[String]) -> anyhow::Result<Command> {
+    if args.first().map(String::as_str) == Some("--serve") {
+        if args.len() != 3 {
+            bail!(usage());
+        }
+        return Ok(Command::Serve {
+            file: PathBuf::from(&args[1]),
+            key: args[2].clone(),
+        });
+    }
+
+    if args.first().map(String::as_str) == Some("--benchmark") {
+        let key = args.get(1).cloned().context(usage())?;
+        let peer = option_value(args, "--peer")?.context("--benchmark requires --peer")?;
+        let bytes_u64 = parse_u64(
+            "--bytes",
+            &option_value(args, "--bytes")?.context("--benchmark requires --bytes")?,
+        )?;
+        let bytes = usize::try_from(bytes_u64).context("--bytes exceeds this platform's usize")?;
+        if bytes == 0 {
+            bail!("--bytes must be greater than zero");
+        }
+        let offset = option_value(args, "--offset")?
+            .map(|raw| parse_u64("--offset", &raw))
+            .transpose()?
+            .unwrap_or(0);
+        let expected_sha256 = option_value(args, "--sha256")?;
+        let result = option_value(args, "--result")?
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("p2p-fetch-result.json"));
+        return Ok(Command::Benchmark {
+            key,
+            peer,
+            offset,
+            bytes,
+            expected_sha256,
+            result,
+        });
+    }
+
+    let key = args.first().cloned().context(usage())?;
+    if args.len() > 2 {
+        bail!(usage());
+    }
+    Ok(Command::Fetch {
+        key,
+        destination: args
+            .get(1)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp/p2p-fetch.out")),
+    })
+}
+
+async fn lookup(
+    transport: &dyn P2pTransport,
+    key: &str,
+    peer: Option<P2pEndpoint>,
+) -> anyhow::Result<agentenv::p2p::P2pArtifactDescriptor> {
+    let hints = peer
+        .map(|endpoint| {
+            vec![P2pArtifactProviderHint {
+                node_id: None,
+                endpoint: Some(endpoint),
+            }]
+        })
+        .unwrap_or_default();
+    transport
+        .lookup_with_hints(&key.to_string(), &hints)
+        .await?
+        .with_context(|| format!("artifact not found: {key}"))
+}
+
+fn print_descriptor(descriptor: &agentenv::p2p::P2pArtifactDescriptor) {
+    println!("[lookup] backend_locator: {:?}", descriptor.backend_locator);
     println!(
-        "[stage 1] backend_locator: {:?}",
-        descriptor.backend_locator
-    );
-    println!(
-        "[stage 1] providers: {:?}",
+        "[lookup] providers: {:?}",
         descriptor
             .providers
             .iter()
-            .map(|p| match p {
+            .map(|provider| match provider {
                 P2pArtifactProvider::Peer(peer) => {
                     format!("peer {} {}", peer.node_id, peer.endpoint.address)
                 }
@@ -94,72 +164,169 @@ async fn main() -> anyhow::Result<()> {
             })
             .collect::<Vec<_>>()
     );
+}
 
-    // Stage 2: fetch to file
-    let t2 = Instant::now();
-    match transport
-        .fetch(&descriptor, std::path::Path::new(&dest))
-        .await
+async fn write_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
     {
-        Ok(size) => println!(
-            "[stage 2] fetch: OK size={size} bytes ({:?}, {:.2} MiB/s) -> {dest}",
-            t2.elapsed(),
-            size as f64 / 1024.0 / 1024.0 / t2.elapsed().as_secs_f64().max(1e-9)
-        ),
-        Err(e) => println!(
-            "[stage 2] fetch: FAILED after {:?}\nerror chain: {:#}",
-            t2.elapsed(),
-            e
-        ),
+        tokio::fs::create_dir_all(parent).await?;
     }
+    let json = serde_json::to_vec_pretty(value)?;
+    tokio::fs::write(path, json)
+        .await
+        .with_context(|| format!("write benchmark result {}", path.display()))
+}
 
-    // Stage 3 (optional): fetch_bytes for small artifacts
-    if std::env::var("P2P_FETCH_BYTES").is_ok() {
-        let t3 = Instant::now();
-        match transport.fetch_bytes(&descriptor).await {
-            Ok(bytes) => println!(
-                "[stage 3] fetch_bytes: OK len={} ({:?})",
-                bytes.len(),
-                t3.elapsed()
-            ),
-            Err(e) => println!(
-                "[stage 3] fetch_bytes: FAILED after {:?}\nerror chain: {:#}",
-                t3.elapsed(),
-                e
-            ),
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,agentenv::p2p=debug".into()),
+        )
+        .init();
+
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let command = parse_command(&args)?;
+    let init_started = Instant::now();
+    let config_manager = agentenv::cfg::ConfigManager::init_global()?;
+    let config = config_manager.config();
+    let identity = NodeIdentity::from_config(&config.node_identity);
+    let transport = transport_from_config(config, &identity).await?;
+    let transport_init_ms = init_started.elapsed().as_secs_f64() * 1000.0;
+    let local_endpoint = transport
+        .local_endpoint()
+        .context("configured P2P transport has no local endpoint")?;
+    println!("[init] transport: {}", local_endpoint.backend);
+    println!("[init] duration: {transport_init_ms:.3} ms");
+    println!("[init] local endpoint: {}", local_endpoint.address);
+
+    match command {
+        Command::Serve { file, key } => {
+            let file_size = tokio::fs::metadata(&file).await?.len();
+            let publish_started = Instant::now();
+            transport
+                .publish(&P2pPublishRequest::file(key.clone(), file.clone()))
+                .await?;
+            println!(
+                "[serve] published {} bytes in {:.3} ms",
+                file_size,
+                publish_started.elapsed().as_secs_f64() * 1000.0
+            );
+            println!("[serve] file: {}", file.display());
+            println!("[serve] key: {key}");
+            println!("[serve] endpoint: {}", local_endpoint.address);
+            println!("[serve] serving until interrupted...");
+            tokio::signal::ctrl_c().await?;
         }
-    }
+        Command::Fetch { key, destination } => {
+            let lookup_started = Instant::now();
+            let descriptor = lookup(transport.as_ref(), &key, None).await?;
+            println!(
+                "[lookup] completed in {:.3} ms",
+                lookup_started.elapsed().as_secs_f64() * 1000.0
+            );
+            print_descriptor(&descriptor);
+            let fetch_started = Instant::now();
+            let size = transport.fetch(&descriptor, &destination).await?;
+            let elapsed = fetch_started.elapsed();
+            println!(
+                "[fetch] received {size} bytes in {:.3} ms ({:.2} MiB/s) -> {}",
+                elapsed.as_secs_f64() * 1000.0,
+                size as f64 / 1024.0 / 1024.0 / elapsed.as_secs_f64().max(1e-9),
+                destination.display()
+            );
+        }
+        Command::Benchmark {
+            key,
+            peer,
+            offset,
+            bytes,
+            expected_sha256,
+            result,
+        } => {
+            let peer_endpoint = P2pEndpoint {
+                backend: local_endpoint.backend.clone(),
+                address: peer.clone(),
+            };
+            let lookup_started = Instant::now();
+            let descriptor = lookup(transport.as_ref(), &key, Some(peer_endpoint)).await?;
+            let lookup_ms = lookup_started.elapsed().as_secs_f64() * 1000.0;
+            print_descriptor(&descriptor);
 
-    // Stage 4 (optional): byte range fetch
-    if std::env::var("P2P_FETCH_RANGE").is_ok() {
-        let t4 = Instant::now();
-        match transport.fetch_byte_range(&descriptor, 0, 4096).await {
-            Ok(mut stream) => {
-                use futures::StreamExt;
-                let mut got = 0usize;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => got += bytes.len(),
-                        Err(e) => {
-                            println!("[stage 4] range stream error: {e:#}");
-                            break;
-                        }
-                    }
+            let transfer_started = Instant::now();
+            let prepare_started = Instant::now();
+            let mut stream = transport
+                .fetch_byte_range(&descriptor, offset, bytes)
+                .await?;
+            let stream_prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
+            let mut first_byte_ms = None;
+            let mut received = 0usize;
+            // Hashing is optional because SHA-256 can become the bottleneck on
+            // fast URMA links. Use it for correctness runs, not throughput runs.
+            let mut hasher = expected_sha256.as_ref().map(|_| Sha256::new());
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                first_byte_ms
+                    .get_or_insert_with(|| transfer_started.elapsed().as_secs_f64() * 1000.0);
+                received = received
+                    .checked_add(chunk.len())
+                    .context("received byte count overflow")?;
+                if let Some(hasher) = hasher.as_mut() {
+                    hasher.update(&chunk);
                 }
-                println!(
-                    "[stage 4] fetch_byte_range: OK got={got} bytes ({:?})",
-                    t4.elapsed()
+            }
+            let transfer_ms = transfer_started.elapsed().as_secs_f64() * 1000.0;
+            if received != bytes {
+                bail!("short benchmark read: requested {bytes} bytes, received {received}");
+            }
+            let digest = hasher.map(|hasher| hex::encode(hasher.finalize()));
+            let verified = expected_sha256
+                .as_ref()
+                .zip(digest.as_ref())
+                .map(|(expected, digest)| expected.eq_ignore_ascii_case(digest));
+            if verified == Some(false) {
+                bail!(
+                    "SHA-256 mismatch: expected {}, received {}",
+                    expected_sha256.as_deref().unwrap_or_default(),
+                    digest.as_deref().unwrap_or_default()
                 );
             }
-            Err(e) => println!(
-                "[stage 4] fetch_byte_range: FAILED after {:?}\nerror chain: {:#}",
-                t4.elapsed(),
-                e
-            ),
+            let throughput_mib_s =
+                received as f64 / 1024.0 / 1024.0 / (transfer_ms / 1000.0).max(1e-9);
+            let report = BenchmarkResult {
+                schema: "agentenv.p2p-fetch-benchmark.v1",
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                transport: local_endpoint.backend,
+                local_endpoint: local_endpoint.address,
+                peer_endpoint: peer,
+                key,
+                offset,
+                requested_bytes: bytes,
+                received_bytes: received,
+                transport_init_ms,
+                lookup_ms,
+                stream_prepare_ms,
+                first_byte_ms: first_byte_ms.context("benchmark stream returned no data")?,
+                transfer_ms,
+                throughput_mib_s,
+                sha256: digest,
+                sha256_verified: verified,
+            };
+            write_json(&result, &report).await?;
+            println!(
+                "[benchmark] received {} bytes in {:.3} ms ({:.2} MiB/s)",
+                report.received_bytes, report.transfer_ms, report.throughput_mib_s
+            );
+            if let Some(digest) = &report.sha256 {
+                println!("[benchmark] SHA-256: {digest}");
+            }
+            println!("[benchmark] result: {}", result.display());
         }
     }
 
-    transport.shutdown().await.ok();
-    println!("done");
+    transport.shutdown().await?;
     Ok(())
 }

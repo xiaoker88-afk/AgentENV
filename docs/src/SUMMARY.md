@@ -20,6 +20,7 @@
 - [Static Multi-Node (Without Kubernetes)](./deployment/static-multi-node.md)
 - [从 NFS 切换到内网 S3](./deployment/nfs-to-intranet-s3.md)
 - [切换 Iroh 与 URMA P2P](./deployment/switch-iroh-urma-p2p.md)
+- [两节点 Iroh/URMA P2P 带宽测试](./deployment/p2p-fetch-bandwidth-benchmark.md)
 - [迁移分阶段时延测试](./deployment/migration-latency-benchmark.md)
 - [Kubernetes (Multi-Node)](./deployment/kubernetes.md)
 - [Manual Compile (Single Node)](./deployment/manual-compile.md)
