@@ -497,7 +497,57 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(commands[1][-1].endswith("systemctl stop agentenv"))
         self.assertTrue(commands[3][-1].endswith("systemctl start agentenv"))
         self.assertIn("/var/lib/aenv/cache/rootfs", commands[2][-1])
+        self.assertEqual(
+            runner.call_args_list[1].kwargs["timeout"],
+            bench.SERVICE_TRANSITION_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            runner.call_args_list[3].kwargs["timeout"],
+            bench.SERVICE_TRANSITION_TIMEOUT_SECONDS,
+        )
         active.assert_called_once_with("root@b", "agentenv", "target")
+
+    def test_target_cache_cleanup_continues_when_stop_times_out_but_service_is_inactive(self):
+        spec = {"home": "/var/lib/aenv", "targets": []}
+        results = [
+            subprocess.CompletedProcess([], 0, json.dumps(spec), ""),
+            subprocess.TimeoutExpired(["ssh", "systemctl stop agentenv"], 300),
+            subprocess.CompletedProcess([], 3, "inactive\n", ""),
+            subprocess.CompletedProcess([], 0, "[]", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        with mock.patch.object(
+            bench,
+            "service_environment",
+            return_value={"AENV_CONFIG_PATH": "/etc/agentenv/config.toml"},
+        ), mock.patch.object(bench, "run_command", side_effect=results) as runner, mock.patch.object(
+            bench, "ensure_service_active"
+        ) as active:
+            self.assertEqual(bench.clear_target_caches("root@b", "agentenv"), [])
+
+        commands = [call.args[0] for call in runner.call_args_list]
+        self.assertTrue(commands[2][-1].endswith("systemctl is-active agentenv"))
+        self.assertTrue(commands[4][-1].endswith("systemctl start agentenv"))
+        active.assert_called_once_with("root@b", "agentenv", "target")
+
+    def test_target_cache_cleanup_restarts_runtime_when_clear_fails(self):
+        spec = {"home": "/var/lib/aenv", "targets": []}
+        results = [
+            subprocess.CompletedProcess([], 0, json.dumps(spec), ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 1, "", "clear failed"),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        with mock.patch.object(
+            bench,
+            "service_environment",
+            return_value={"AENV_CONFIG_PATH": "/etc/agentenv/config.toml"},
+        ), mock.patch.object(bench, "run_command", side_effect=results) as runner:
+            with self.assertRaisesRegex(bench.TestFailure, "target cache cleanup failed"):
+                bench.clear_target_caches("root@b", "agentenv")
+
+        commands = [call.args[0] for call in runner.call_args_list]
+        self.assertTrue(commands[3][-1].endswith("systemctl start agentenv"))
 
     def test_target_cache_discovery_reads_configured_generated_json_paths(self):
         with tempfile.TemporaryDirectory() as root:

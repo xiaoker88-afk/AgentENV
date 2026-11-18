@@ -21,6 +21,7 @@ import urllib.request
 from collections import defaultdict
 
 DEFAULT_OUTPUT_ROOT = pathlib.Path.cwd() / "artifacts" / "migration-runs"
+SERVICE_TRANSITION_TIMEOUT_SECONDS = 300
 
 
 class TestFailure(RuntimeError):
@@ -307,15 +308,30 @@ def clear_target_caches(target_ssh: str | None, unit: str) -> list[dict]:
     except json.JSONDecodeError as error:
         raise TestFailure(f"target cache discovery returned invalid JSON: {discovery.stdout!r}") from error
 
-    stopped = False
+    restart_required = False
     try:
-        stop = run_command(host_command(target_ssh, ["systemctl", "stop", unit]), timeout=60)
-        if stop.returncode != 0:
-            raise TestFailure(
-                f"cannot stop target service {unit!r} for cache cleanup: "
-                f"{stop.stderr.strip() or stop.stdout.strip()}"
+        stop_command = host_command(target_ssh, ["systemctl", "stop", unit])
+        # Set this before waiting: systemd may complete the stop after the SSH
+        # client times out, and the service must still be restarted on exit.
+        restart_required = True
+        try:
+            stop = run_command(stop_command, timeout=SERVICE_TRANSITION_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            state = run_command(
+                host_command(target_ssh, ["systemctl", "is-active", unit]), timeout=30
             )
-        stopped = True
+            if state.stdout.strip() not in {"inactive", "failed"}:
+                detail = state.stdout.strip() or state.stderr.strip() or "unknown"
+                raise TestFailure(
+                    f"timed out after {SERVICE_TRANSITION_TIMEOUT_SECONDS}s stopping target "
+                    f"service {unit!r}; current state: {detail}"
+                ) from error
+        else:
+            if stop.returncode != 0:
+                raise TestFailure(
+                    f"cannot stop target service {unit!r} for cache cleanup: "
+                    f"{stop.stderr.strip() or stop.stdout.strip()}"
+                )
         cleared = run_command(
             host_command(
                 target_ssh,
@@ -338,8 +354,11 @@ def clear_target_caches(target_ssh: str | None, unit: str) -> list[dict]:
         except json.JSONDecodeError as error:
             raise TestFailure(f"target cache cleanup returned invalid JSON: {cleared.stdout!r}") from error
     finally:
-        if stopped:
-            start = run_command(host_command(target_ssh, ["systemctl", "start", unit]), timeout=60)
+        if restart_required:
+            start = run_command(
+                host_command(target_ssh, ["systemctl", "start", unit]),
+                timeout=SERVICE_TRANSITION_TIMEOUT_SECONDS,
+            )
             if start.returncode != 0:
                 raise TestFailure(
                     f"cannot restart target service {unit!r} after cache cleanup: "
