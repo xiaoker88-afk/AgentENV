@@ -1081,6 +1081,7 @@ def summarize_run(
         "Wait times include executor scheduling. URMA samples are operations, not migrations.",
         "Shared layer keys can reference multiple snapshots; global statistics count each timing once.",
         "P2P/OSS fetch observations cover logged artifacts, not all lazy disk/memory reads.",
+        "Per-range data-path timings require TRACE logging and are intentionally absent from normal benchmark runs.",
     ]
 
     def table(title: str, rows: list[dict]) -> None:

@@ -608,7 +608,7 @@ impl P2pTransport for IrohBlobsP2pTransport {
             BlobFetchSource::Local { blob_hash } => {
                 let tag = self.pin_blob(blob_hash).await?;
                 let stream = self.export_local_blob_range(blob_hash, range, tag).await?;
-                debug!("fetched artifact range from local P2P store");
+                trace!("fetched artifact range from local P2P store");
                 return Ok(stream);
             }
             BlobFetchSource::Remote {
@@ -625,18 +625,18 @@ impl P2pTransport for IrohBlobsP2pTransport {
         let downloaded = self
             .download_blob(GetRequest::blob_ranges(blob_hash, ranges), providers)
             .await;
-        info!(key = %descriptor.key, offset, bytes = len,
+        trace!(key = %descriptor.key, offset, bytes = len,
             stage = "iroh_range_download", status = if downloaded.is_ok() { "ok" } else { "error" },
             duration_ms = download_started.elapsed().as_secs_f64() * 1000.0,
             "iroh stage timing");
         let tag = downloaded?;
         let export_started = std::time::Instant::now();
         let stream = self.export_local_blob_range(blob_hash, range, tag).await?;
-        info!(key = %descriptor.key, offset, bytes = len,
+        trace!(key = %descriptor.key, offset, bytes = len,
             stage = "iroh_export_prepare", status = "ok",
             duration_ms = export_started.elapsed().as_secs_f64() * 1000.0,
             "iroh stage timing");
-        debug!(providers_count, "fetched artifact range from P2P provider");
+        trace!(providers_count, "fetched artifact range from P2P provider");
         let delivery_started = std::time::Instant::now();
         let first_key = descriptor.key.clone();
         let final_key = descriptor.key.clone();
@@ -651,13 +651,13 @@ impl P2pTransport for IrohBlobsP2pTransport {
             chunks += 1;
             if first {
                 first = false;
-                info!(key = %first_key, offset, bytes = len,
+                trace!(key = %first_key, offset, bytes = len,
                     stage = "iroh_export_first_chunk", status = "observed",
                     duration_ms = delivery_started.elapsed().as_secs_f64() * 1000.0,
                     "iroh stage timing");
             }
             if delivered == len {
-                info!(key = %first_key, offset, bytes = delivered, chunks,
+                trace!(key = %first_key, offset, bytes = delivered, chunks,
                     stage = "iroh_export_last_chunk", status = "observed",
                     duration_ms = delivery_started.elapsed().as_secs_f64() * 1000.0,
                     "iroh stage timing");
@@ -666,7 +666,7 @@ impl P2pTransport for IrohBlobsP2pTransport {
         // This final event requires the consumer to drain the stream. A dropped
         // stream deliberately has no successful delivery-complete event.
         let finished = stream::once(async move {
-            info!(key = %final_key, offset, bytes = len,
+            trace!(key = %final_key, offset, bytes = len,
                 stage = "iroh_export_drained", status = "drained",
                 duration_ms = delivery_started.elapsed().as_secs_f64() * 1000.0,
                 "iroh stage timing");

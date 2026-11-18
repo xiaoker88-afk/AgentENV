@@ -503,6 +503,11 @@ pub struct UblkOverlaybdTomlConfig {
     /// generated overlaybd global configs. Default: `4`.
     #[config(default = 4u64)]
     pub remote_io_workers: u64,
+    /// Foreground cache-miss refill size in bytes. Larger values reduce the
+    /// number of remote range requests for sequential reads, at the cost of
+    /// read amplification for small random reads. Default: `262144` (256 KiB).
+    #[config(default = 262144u32)]
+    pub foreground_refill_size_bytes: u32,
     /// Enable overlaybd layer-level background download. Default: `false`.
     #[config(default = false)]
     pub download_enable: bool,
@@ -1066,6 +1071,12 @@ impl AppConfig {
         self.validate_memory_snapshot_options()?;
         if self.ublk.overlaybd.remote_io_workers == 0 {
             bail!("invalid ublk.overlaybd config: remote_io_workers must be > 0");
+        }
+        let refill_size = self.ublk.overlaybd.foreground_refill_size_bytes;
+        if refill_size < 4096 || !refill_size.is_power_of_two() {
+            bail!(
+                "invalid ublk.overlaybd config: foreground_refill_size_bytes must be a power of two and >= 4096"
+            );
         }
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
@@ -2236,6 +2247,18 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(
             err.to_string().contains("resize_timeout_secs must be > 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_overlaybd_foreground_refill_size() {
+        let mut config = AppConfig::default();
+        config.ublk.overlaybd.foreground_refill_size_bytes = 300_000;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("foreground_refill_size_bytes must be a power of two and >= 4096"),
             "unexpected error: {err}"
         );
     }

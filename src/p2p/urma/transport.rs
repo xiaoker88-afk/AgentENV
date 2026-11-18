@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, info, instrument, warn, Instrument};
+use tracing::{debug, info, instrument, trace, warn, Instrument};
 
 use super::bounce_pool::BounceBufferPool;
 use super::catalog::{jetty_descriptor_address, CatalogServer, RemoteCatalog, UrmaCatalog};
@@ -522,7 +522,7 @@ impl UrmaP2pTransport {
         let scheduled = Instant::now();
         let stream_span = tracing::info_span!("urma_stream", key = %key);
         let stream = async move {
-            debug!(
+            trace!(
                 key,
                 offset,
                 bytes = len,
@@ -546,7 +546,7 @@ impl UrmaP2pTransport {
                     streamed,
                     duration.as_secs_f64(),
                 );
-                debug!(
+                trace!(
                     bytes = streamed,
                     elapsed_ms = duration.as_millis() as u64,
                     mbps = if duration.as_secs_f64() > 0.0 {
@@ -577,7 +577,7 @@ impl UrmaP2pTransport {
                 let chunk_len = remaining.min(window);
                 let read_start = Instant::now();
                 let read_timer = StageTimer::start(&key, "read_window");
-                debug!(
+                trace!(
                     key,
                     offset = pos,
                     bytes = chunk_len,
@@ -607,7 +607,7 @@ impl UrmaP2pTransport {
                     read_start.elapsed().as_secs_f64(),
                 );
                 let read_elapsed = read_start.elapsed();
-                debug!(
+                trace!(
                     bytes = chunk_len,
                     elapsed_ms = read_elapsed.as_millis() as u64,
                     mbps = if read_elapsed.as_secs_f64() > 0.0 {

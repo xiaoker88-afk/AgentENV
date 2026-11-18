@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use tracing::{debug, info, warn};
+use tracing::{debug, trace, warn};
 
 use super::catalog::jetty_descriptor_from_address;
 use super::context::UrmaContext;
@@ -138,7 +138,7 @@ impl RmReader {
             }
         };
         let import_ms = import_started.elapsed().as_secs_f64() * 1000.0;
-        debug!(
+        trace!(
             tjetty = conn.tjetty.0,
             remote_tseg = imported.tseg.0,
             mva = imported.mva,
@@ -210,7 +210,7 @@ impl RmReader {
             remote_off += chunk as u64;
             remaining -= chunk as u64;
         }
-        info!(
+        trace!(
             stage = "read_range_breakdown",
             remote_va = locator.va,
             offset,

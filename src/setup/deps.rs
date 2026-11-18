@@ -799,7 +799,7 @@ fn write_generated_overlaybd_global_config(
             "cacheType": "file",
             "cacheDir": image_cache.remote_blocks_dir,
             "cacheSizeGB": image_cache.remote_blocks_size_gb,
-            "refillSize": 262144,
+            "refillSize": app_config.ublk.overlaybd.foreground_refill_size_bytes,
             "blockSize": 65536
         },
         "credentialFilePath": credential_file_path,
@@ -1341,18 +1341,27 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let rootfs = temp.path().join("overlaybd-global.json");
         let mem = temp.path().join("mem-overlaybd-global.json");
-        let config =
+        let mut config =
             app_config_with_overlaybd_global_configs(temp.path(), rootfs.clone(), mem.clone());
+        config.ublk.overlaybd.foreground_refill_size_bytes = 4 * 1024 * 1024;
 
         write_generated_overlaybd_global_configs(&config, None).expect("write global configs");
 
         let rootfs_value = read_global_config_value(&rootfs);
+        assert_eq!(
+            rootfs_value["cacheConfig"]["refillSize"],
+            4 * 1024 * 1024
+        );
         assert_eq!(rootfs_value["download"]["enable"], false);
         assert_eq!(rootfs_value["download"]["concurrency"], 1);
         let expected_memory = MemorySnapshotConfig::default()
             .background_download
             .to_overlaybd_download_config();
         let memory_value = read_global_config_value(&mem);
+        assert_eq!(
+            memory_value["cacheConfig"]["refillSize"],
+            4 * 1024 * 1024
+        );
         assert_download_json(&memory_value, &expected_memory);
     }
 

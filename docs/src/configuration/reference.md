@@ -587,6 +587,8 @@ OverlayBD configuration for ublk. Legacy `enabled` and `device_type` keys are ig
 | `runtime_upper_mode` | string | `"hybridLogStructured"` | Runtime upper format for newly materialized writable rootfs OverlayBD images. Supported values are `"logStructured"`, `"hybridLogStructured"`, and `"sparse"`. Existing source uppers keep their own mode |
 | `allow_shrink` | boolean | `false` | Allows an explicit cold-start `diskSizeMB` smaller than the source rootfs. Explicit sizes use MiB and must be divisible by 1024. Growth is always allowed; snapshot resume never resizes. |
 | `resize_timeout_secs` | integer | `120` | Timeout in seconds for the cold-start OverlayBD resize tool. Must be greater than zero. |
+| `remote_io_workers` | integer | `4` | Worker threads used by the OverlayBD runtime for remote I/O. Must be greater than zero. |
+| `foreground_refill_size_bytes` | integer | `262144` | Foreground cache-miss range size. Must be a power of two and at least 4096 bytes. Larger values reduce request count for sequential reads but increase read amplification for small random reads. |
 | `download_enable` | boolean | `false` | Enables overlaybd layer-level background download for remote layers |
 | `p2p_lookup_timeout_ms` | integer | `300` | Timeout for one foreground Overlaybd descriptor lookup through the localhost P2P HTTP facade. Timeout is treated as a cacheable miss. |
 | `p2p_fetch_range_timeout_ms` | integer | `2000` | Timeout for one foreground Overlaybd range fetch through the localhost P2P HTTP facade before falling back to the origin registry. |
@@ -597,7 +599,7 @@ The file at the configured default path
 `$AENV_HOME/overlaybd/overlaybd-global.json` is **auto-generated** by the server
 at startup. The generated JSON incorporates several TOML settings —
 `[image.cache].root_dir`, `[image.cache.remote_blocks].max_size_gb`,
-`download_enable`, `[backend.oss]` credentials, and Docker registry credentials
+`download_enable`, `foreground_refill_size_bytes`, `[backend.oss]` credentials, and Docker registry credentials
 detected from `~/.docker/config.json` — into a single overlaybd runtime config
 file.
 

@@ -25,21 +25,34 @@ impl StageTimer {
 
 impl Drop for StageTimer {
     fn drop(&mut self) {
+        let duration_ms = self.started.elapsed().as_secs_f64() * 1000.0;
         if self.status == "ok"
             && matches!(
                 self.stage,
-                "bounce_pool_lease" | "bounce_pool_release" | "read_window" | "stream_copy_deliver"
+                "bounce_pool_lease"
+                    | "bounce_pool_release"
+                    | "read_window"
+                    | "stream_copy_deliver"
+                    | "stream_total"
             )
         {
-            return;
+            tracing::trace!(
+                target: "agentenv::p2p::urma::timing",
+                key = %self.key,
+                stage = self.stage,
+                status = self.status,
+                duration_ms,
+                "urma stage timing"
+            );
+        } else {
+            tracing::info!(
+                target: "agentenv::p2p::urma::timing",
+                key = %self.key,
+                stage = self.stage,
+                status = self.status,
+                duration_ms,
+                "urma stage timing"
+            );
         }
-        tracing::info!(
-            target: "agentenv::p2p::urma::timing",
-            key = %self.key,
-            stage = self.stage,
-            status = self.status,
-            duration_ms = self.started.elapsed().as_secs_f64() * 1000.0,
-            "urma stage timing"
-        );
     }
 }
