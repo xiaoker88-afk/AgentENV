@@ -23,7 +23,9 @@ use crate::snapshot::repository::backends::common::recontainerize::{
 use crate::snapshot::repository::backends::common::{
     materialize_volume_image_config, write_dense_overlaybd_layer_to_file,
 };
-use crate::snapshot::repository::interfaces::{SnapshotPublication, SnapshotRepository};
+use crate::snapshot::repository::interfaces::{
+    PreparedLayerObserver, SnapshotPublication, SnapshotRepository,
+};
 use crate::snapshot::repository::{
     BuildCacheState, RepositoryError, RepositoryResult, VolumeRecordPage,
 };
@@ -282,7 +284,7 @@ impl SnapshotRepository for OssSnapshotRepository {
         recording: Option<crate::snapshot::StartupRecording>,
     ) -> RepositoryResult<SnapshotRecord> {
         Ok(self
-            .publish_with_local_layers(metadata, manifest, recording)
+            .publish_with_local_layers(metadata, manifest, recording, None)
             .await?
             .record)
     }
@@ -292,6 +294,7 @@ impl SnapshotRepository for OssSnapshotRepository {
         metadata: SnapshotPublishMetadata,
         manifest: SandboxSnapshotManifest,
         recording: Option<crate::snapshot::StartupRecording>,
+        prepared_layer_observer: Option<PreparedLayerObserver>,
     ) -> RepositoryResult<SnapshotPublication> {
         let id = &metadata.id;
         let layout = self.layout(id);
@@ -334,6 +337,7 @@ impl SnapshotRepository for OssSnapshotRepository {
                     DiskImageSubject::Rootfs,
                     &manifest.rootfs.image_config_path,
                     Some(rootfs_config),
+                    prepared_layer_observer.as_ref(),
                 )
                 .await?;
             if let Some(publication) = rootfs_outcome.publication.clone() {
@@ -343,7 +347,11 @@ impl SnapshotRepository for OssSnapshotRepository {
             let rootfs_layers = rootfs_outcome.layers;
 
             let memory_layers = self
-                .derive_and_upload_memory_layers(&manifest.memory.image_config_path, &mut local_layers)
+                .derive_and_upload_memory_layers(
+                    &manifest.memory.image_config_path,
+                    &mut local_layers,
+                    prepared_layer_observer.as_ref(),
+                )
                 .await?;
 
             // 2. Upload per-snapshot fixed artifacts.
@@ -385,7 +393,13 @@ impl SnapshotRepository for OssSnapshotRepository {
 
             // 3. Export attached-drive disk images and derive their committed metadata.
             let attached_drives = self
-                .export_attached_drives(id, &manifest, &mut disk_publications, &mut local_layers)
+                .export_attached_drives(
+                    id,
+                    &manifest,
+                    &mut disk_publications,
+                    &mut local_layers,
+                    prepared_layer_observer.as_ref(),
+                )
                 .await?;
 
             // 4. Construct committed CommittedSnapshot.
@@ -1361,6 +1375,7 @@ impl OssSnapshotRepository {
         &self,
         image_config_path: &Path,
         artifact: OssUploadArtifact,
+        prepared_layer_observer: Option<&PreparedLayerObserver>,
     ) -> RepositoryResult<DiskImageExportOutcome> {
         let mut local_layers = Vec::new();
         let layers = self
@@ -1369,6 +1384,7 @@ impl OssSnapshotRepository {
                 artifact,
                 false,
                 &mut local_layers,
+                prepared_layer_observer,
             )
             .await?;
         Ok(DiskImageExportOutcome {
@@ -1389,6 +1405,7 @@ impl OssSnapshotRepository {
             artifact,
             false,
             &mut Vec::new(),
+            None,
         )
         .await
     }
@@ -1402,6 +1419,7 @@ impl OssSnapshotRepository {
             OssUploadArtifact::RootfsLayer,
             true,
             &mut Vec::new(),
+            None,
         )
         .await
     }
@@ -1412,6 +1430,7 @@ impl OssSnapshotRepository {
         artifact: OssUploadArtifact,
         allow_descriptorless: bool,
         local_layers: &mut Vec<PreparedLayerUpload>,
+        prepared_layer_observer: Option<&PreparedLayerObserver>,
     ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
         let image_config = load_overlaybd_image_config(image_config_path).map_err(|e| {
             RepositoryError::backend(
@@ -1436,6 +1455,7 @@ impl OssSnapshotRepository {
                             layer.size,
                             artifact,
                             local_layers,
+                            prepared_layer_observer,
                         )
                         .await?;
                     layers.push(OverlaybdLayerRef::Managed(managed));
@@ -1443,14 +1463,24 @@ impl OssSnapshotRepository {
                 }
                 if crate::image::local_layer::rootfs_layer_is_runtime_generated_delta(layer_path) {
                     let managed = self
-                        .import_descriptorless_rootfs_layer(layer_path, artifact, local_layers)
+                        .import_descriptorless_rootfs_layer(
+                            layer_path,
+                            artifact,
+                            local_layers,
+                            prepared_layer_observer,
+                        )
                         .await?;
                     layers.push(OverlaybdLayerRef::Managed(managed));
                     continue;
                 }
                 if allow_descriptorless {
                     let managed = self
-                        .import_descriptorless_rootfs_layer(layer_path, artifact, local_layers)
+                        .import_descriptorless_rootfs_layer(
+                            layer_path,
+                            artifact,
+                            local_layers,
+                            prepared_layer_observer,
+                        )
                         .await?;
                     layers.push(OverlaybdLayerRef::Managed(managed));
                     continue;
@@ -1492,6 +1522,7 @@ impl OssSnapshotRepository {
         &self,
         mem_image_config_path: &Path,
         local_layers: &mut Vec<PreparedLayerUpload>,
+        prepared_layer_observer: Option<&PreparedLayerObserver>,
     ) -> RepositoryResult<Vec<ManagedLayer>> {
         let image_config = load_overlaybd_image_config(mem_image_config_path).map_err(|e| {
             RepositoryError::backend(
@@ -1531,6 +1562,7 @@ impl OssSnapshotRepository {
                         layer.size,
                         OssUploadArtifact::MemoryLayer,
                         local_layers,
+                        prepared_layer_observer,
                     )
                     .await?,
                 );
@@ -1541,6 +1573,7 @@ impl OssSnapshotRepository {
                     layer_path,
                     OssUploadArtifact::MemoryLayer,
                     local_layers,
+                    prepared_layer_observer,
                 )
                 .await?,
             );
@@ -1555,6 +1588,7 @@ impl OssSnapshotRepository {
         subject: DiskImageSubject,
         image_config_path: &Path,
         config: Option<SnapshotOciConfigInput<'_>>,
+        prepared_layer_observer: Option<&PreparedLayerObserver>,
     ) -> RepositoryResult<DiskImageExportOutcome> {
         let artifact = match &subject {
             DiskImageSubject::Rootfs => OssUploadArtifact::RootfsLayer,
@@ -1565,7 +1599,7 @@ impl OssSnapshotRepository {
             SnapshotImageStoragePolicy::SourceRegistry
         ) {
             return self
-                .export_managed_disk_image(image_config_path, artifact)
+                .export_managed_disk_image(image_config_path, artifact, prepared_layer_observer)
                 .await;
         }
         match self
@@ -1590,7 +1624,7 @@ impl OssSnapshotRepository {
                     reason = %feature,
                     "falling back to managed disk image layers"
                 );
-                self.export_managed_disk_image(image_config_path, artifact)
+                self.export_managed_disk_image(image_config_path, artifact, prepared_layer_observer)
                     .await
             }
             result => result,
@@ -1739,6 +1773,7 @@ impl OssSnapshotRepository {
         manifest: &crate::sandbox::SandboxSnapshotManifest,
         publications: &mut Vec<PersistedDiskImagePublication>,
         local_layers: &mut Vec<PreparedLayerUpload>,
+        prepared_layer_observer: Option<&PreparedLayerObserver>,
     ) -> RepositoryResult<Vec<CommittedAttachedDrive>> {
         let mut drives = Vec::new();
 
@@ -1751,6 +1786,7 @@ impl OssSnapshotRepository {
                     },
                     &drive.image_config_path,
                     None,
+                    prepared_layer_observer,
                 )
                 .await?;
             if let Some(publication) = outcome.publication.clone() {
@@ -1857,6 +1893,7 @@ impl OssSnapshotRepository {
         source: &Path,
         artifact: OssUploadArtifact,
         local_layers: &mut Vec<PreparedLayerUpload>,
+        prepared_layer_observer: Option<&PreparedLayerObserver>,
     ) -> RepositoryResult<ManagedLayer> {
         let canonical = std::fs::canonicalize(source).map_err(|e| {
             RepositoryError::backend(
@@ -1866,11 +1903,21 @@ impl OssSnapshotRepository {
         })?;
         if dense_export::should_dense_export_layer(&canonical) {
             return self
-                .import_sparse_overlaybd_layer_dense(&canonical, artifact, local_layers)
+                .import_sparse_overlaybd_layer_dense(
+                    &canonical,
+                    artifact,
+                    local_layers,
+                    prepared_layer_observer,
+                )
                 .await;
         }
-        self.import_managed_layer_by_hash(&canonical, artifact, local_layers)
-            .await
+        self.import_managed_layer_by_hash(
+            &canonical,
+            artifact,
+            local_layers,
+            prepared_layer_observer,
+        )
+        .await
     }
 
     async fn import_sparse_overlaybd_layer_dense(
@@ -1878,6 +1925,7 @@ impl OssSnapshotRepository {
         canonical: &Path,
         artifact: OssUploadArtifact,
         local_layers: &mut Vec<PreparedLayerUpload>,
+        prepared_layer_observer: Option<&PreparedLayerObserver>,
     ) -> RepositoryResult<ManagedLayer> {
         let dense_temp = tempfile::NamedTempFile::new().map_err(|e| {
             RepositoryError::backend(
@@ -1908,8 +1956,14 @@ impl OssSnapshotRepository {
         .await?;
         upload.retain_source(dense_temp);
         // Dense-exported layers never carry a layer uuid, recontainerized or not.
-        self.upload_prepared_layer(upload, None, artifact, local_layers)
-            .await
+        self.upload_prepared_layer(
+            upload,
+            None,
+            artifact,
+            local_layers,
+            prepared_layer_observer,
+        )
+        .await
     }
 
     async fn import_managed_layer_by_hash(
@@ -1917,6 +1971,7 @@ impl OssSnapshotRepository {
         source: &Path,
         artifact: OssUploadArtifact,
         local_layers: &mut Vec<PreparedLayerUpload>,
+        prepared_layer_observer: Option<&PreparedLayerObserver>,
     ) -> RepositoryResult<ManagedLayer> {
         let canonical = std::fs::canonicalize(source).map_err(|e| {
             RepositoryError::backend(
@@ -1926,8 +1981,14 @@ impl OssSnapshotRepository {
         })?;
         let upload = prepare_layer_upload(&canonical, self.publish_compression, None).await?;
         let uuid = overlaybd_layer_uuid(upload.path());
-        self.upload_prepared_layer(upload, uuid, artifact, local_layers)
-            .await
+        self.upload_prepared_layer(
+            upload,
+            uuid,
+            artifact,
+            local_layers,
+            prepared_layer_observer,
+        )
+        .await
     }
 
     async fn import_managed_layer_with_descriptor(
@@ -1937,6 +1998,7 @@ impl OssSnapshotRepository {
         size: u64,
         artifact: OssUploadArtifact,
         local_layers: &mut Vec<PreparedLayerUpload>,
+        prepared_layer_observer: Option<&PreparedLayerObserver>,
     ) -> RepositoryResult<ManagedLayer> {
         let canonical = std::fs::canonicalize(source).map_err(|e| {
             RepositoryError::backend(
@@ -1973,8 +2035,14 @@ impl OssSnapshotRepository {
             prepare_layer_upload(&canonical, self.publish_compression, Some((digest, size)))
                 .await?;
         let uuid = overlaybd_layer_uuid(upload.path());
-        self.upload_prepared_layer(upload, uuid, artifact, local_layers)
-            .await
+        self.upload_prepared_layer(
+            upload,
+            uuid,
+            artifact,
+            local_layers,
+            prepared_layer_observer,
+        )
+        .await
     }
 
     /// Upload a prepared layer under its content-addressed key and build the
@@ -1986,8 +2054,12 @@ impl OssSnapshotRepository {
         uuid: Option<String>,
         artifact: OssUploadArtifact,
         local_layers: &mut Vec<PreparedLayerUpload>,
+        prepared_layer_observer: Option<&PreparedLayerObserver>,
     ) -> RepositoryResult<ManagedLayer> {
         let oss_key = OssSnapshotArtifactLayout::managed_layer_key(upload.digest());
+        if let Some(observer) = prepared_layer_observer {
+            observer(upload.descriptor());
+        }
         upload_managed_layer_if_missing(&self.client, &oss_key, upload.path(), artifact).await?;
         let layer = ManagedLayer {
             digest: upload.digest().to_string(),

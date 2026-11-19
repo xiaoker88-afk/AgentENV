@@ -58,6 +58,16 @@ impl PreparedLayerUpload {
     pub(crate) fn size(&self) -> u64 {
         self.size
     }
+
+    pub(crate) fn descriptor(
+        &self,
+    ) -> crate::snapshot::repository::interfaces::PreparedLayerDescriptor {
+        crate::snapshot::repository::interfaces::PreparedLayerDescriptor {
+            path: self.path.clone(),
+            digest: self.digest.clone(),
+            size: self.size,
+        }
+    }
 }
 
 /// Prepare the local layer `source` for upload under the publish-compression
@@ -278,6 +288,10 @@ mod tests {
         let descriptor = FileDigest::describe(&source).await.expect("describe raw");
         assert_eq!(prepared.digest(), descriptor.sha256);
         assert_eq!(prepared.size(), descriptor.size);
+        let observed = prepared.descriptor();
+        assert_eq!(observed.path, prepared.path());
+        assert_eq!(observed.digest, prepared.digest());
+        assert_eq!(observed.size, prepared.size());
         assert_eq!(probe_zfile(prepared.path()).await, 0);
     }
 

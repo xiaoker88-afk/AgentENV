@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Context;
@@ -15,7 +15,8 @@ use crate::sandbox::{
 };
 use crate::snapshot::repository::backends::build_snapshot_backend;
 use crate::snapshot::repository::interfaces::{
-    SnapshotPublication, SnapshotRepository, SnapshotRuntimeResolver,
+    PreparedLayerDescriptor, PreparedLayerObserver, SnapshotPublication, SnapshotRepository,
+    SnapshotRuntimeResolver,
 };
 use crate::snapshot::repository::SnapshotListFilter;
 use crate::snapshot::{
@@ -119,7 +120,7 @@ impl SnapshotManager {
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
         let publication = self
             .repository
-            .publish_with_local_layers(metadata, manifest.clone(), recording)
+            .publish_with_local_layers(metadata, manifest.clone(), recording, None)
             .await?;
         self.publish_p2p_artifacts(&publication, &manifest, Vec::new())
             .await;
@@ -166,6 +167,54 @@ impl SnapshotManager {
             });
 
         let prepare_id = metadata.id.clone();
+        let prepare_candidates = if backend == "oss" {
+            SnapshotP2pArtifact::prepare_candidates(&prepare_id, &manifest)
+        } else {
+            Vec::new()
+        };
+        let prepared_layer_keys = Arc::new(Mutex::new(
+            prepare_candidates
+                .iter()
+                .map(|artifact| artifact.key.clone())
+                .collect::<HashSet<_>>(),
+        ));
+        let prepared_layer_tasks = Arc::new(Mutex::new(Vec::new()));
+        let prepared_layer_concurrency = Arc::new(tokio::sync::Semaphore::new(
+            SNAPSHOT_P2P_PUBLISH_CONCURRENCY,
+        ));
+        let prepared_layer_observer = self.p2p_transport.as_ref().and_then(|transport| {
+            if backend != "oss" {
+                return None;
+            }
+            let transport = Arc::clone(transport);
+            let keys = Arc::clone(&prepared_layer_keys);
+            let tasks = Arc::clone(&prepared_layer_tasks);
+            let concurrency = Arc::clone(&prepared_layer_concurrency);
+            Some(Arc::new(move |layer: PreparedLayerDescriptor| {
+                let artifact = SnapshotP2pArtifact::content_addressed_overlaybd_layer(
+                    layer.path,
+                    layer.digest,
+                    layer.size,
+                );
+                if !keys.lock().unwrap().insert(artifact.key.clone()) {
+                    return;
+                }
+                let transport = Arc::clone(&transport);
+                let concurrency = Arc::clone(&concurrency);
+                let task = tokio::spawn(async move {
+                    let _permit = concurrency.acquire_owned().await.ok()?;
+                    match artifact.prepare(&transport).await {
+                        Ok(Some(prepared)) => Some((artifact, prepared)),
+                        Ok(None) => None,
+                        Err(error) => {
+                            warn!(key = %artifact.key, error = %error, "final snapshot layer P2P preparation failed; retrying after commit");
+                            None
+                        }
+                    }
+                });
+                tasks.lock().unwrap().push(task);
+            }) as PreparedLayerObserver)
+        });
         let prepare = async {
             if backend != "oss" {
                 return Vec::new();
@@ -174,7 +223,7 @@ impl SnapshotManager {
                 return Vec::new();
             };
             let started = Instant::now();
-            let prepared = stream::iter(SnapshotP2pArtifact::prepare_candidates(&prepare_id, &manifest))
+            let prepared = stream::iter(prepare_candidates)
                 .map(|artifact| async move {
                     match artifact.prepare(transport).await {
                         Ok(Some(prepared)) => Some((artifact, prepared)),
@@ -205,7 +254,12 @@ impl SnapshotManager {
             let repository_started = Instant::now();
             let publication = self
                 .repository
-                .publish_with_local_layers(metadata, manifest.clone(), recording)
+                .publish_with_local_layers(
+                    metadata,
+                    manifest.clone(),
+                    recording,
+                    prepared_layer_observer,
+                )
                 .await;
             migration_timing::log_stage(
                 "snapshot_repository_publish",
@@ -221,7 +275,21 @@ impl SnapshotManager {
         };
         // Both futures are scoped: captured_snapshot and all preparation guards
         // stay alive through repository commit, failure, and cancellation.
-        let (publication, prepared) = tokio::join!(publish_repository, prepare);
+        let (publication, mut prepared) = tokio::join!(publish_repository, prepare);
+        let layer_tasks = std::mem::take(&mut *prepared_layer_tasks.lock().unwrap());
+        let mut prepared_layers = stream::iter(layer_tasks)
+            .filter_map(|task| async move {
+                match task.await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        warn!(error = %error, "final snapshot layer P2P preparation task failed; retrying after commit");
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+            .await;
+        prepared.append(&mut prepared_layers);
         let publication = publication?;
 
         if self.p2p_transport.is_some() {
@@ -557,7 +625,12 @@ mod tests {
             write_mock_built_artifacts(&workspace.path().join("artifacts")).unwrap();
         let publication = manager
             .repository
-            .publish_with_local_layers(SnapshotPublishMetadata::mock(), manifest.clone(), None)
+            .publish_with_local_layers(
+                SnapshotPublishMetadata::mock(),
+                manifest.clone(),
+                None,
+                None,
+            )
             .await
             .unwrap();
         let matching = SnapshotP2pArtifact::fixed(

@@ -10,6 +10,21 @@ use crate::snapshot::types::{
     TemplateBuildErrorReason, TemplateBuildStatus,
 };
 
+/// Stable identity and local path of the exact layer bytes selected for a
+/// repository upload. The path stays alive until [`SnapshotPublication`] is
+/// dropped.
+#[derive(Clone, Debug)]
+pub struct PreparedLayerDescriptor {
+    /// Local file containing the exact bytes selected for upload.
+    pub path: PathBuf,
+    /// Content digest of `path` as stored in the committed snapshot.
+    pub digest: String,
+    /// Byte length of `path`.
+    pub size: u64,
+}
+
+pub type PreparedLayerObserver = Arc<dyn Fn(PreparedLayerDescriptor) + Send + Sync + 'static>;
+
 /// A committed snapshot and the local upload files kept alive for post-commit
 /// publication. Temporary paths are never stored in the durable record.
 #[derive(Debug)]
@@ -172,11 +187,15 @@ pub trait SnapshotRepository: Send + Sync {
 
     /// Like `publish`, retaining any transformed local layer files until the
     /// caller finishes best-effort P2P publication after the durable commit.
+    /// `prepared_layer_observer` is called immediately before each final local
+    /// layer begins its repository upload, allowing independent preparation to
+    /// overlap the upload without making the layer visible before commit.
     async fn publish_with_local_layers(
         &self,
         metadata: SnapshotPublishMetadata,
         manifest: SandboxSnapshotManifest,
         recording: Option<crate::snapshot::StartupRecording>,
+        _prepared_layer_observer: Option<PreparedLayerObserver>,
     ) -> RepositoryResult<SnapshotPublication> {
         Ok(SnapshotPublication {
             record: self.publish(metadata, manifest, recording).await?,
