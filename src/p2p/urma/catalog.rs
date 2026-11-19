@@ -24,7 +24,8 @@
 //! RNR-fail the senders). Responses are sent from a pooled set of buffers,
 //! one handler task per request.
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -49,6 +50,7 @@ const CLIENT_BUFFER_POOL_SIZE: usize = 2;
 /// Catalog query request body.
 #[derive(Serialize, Deserialize)]
 pub struct CatalogRequest {
+    pub request_id: u64,
     pub key: String,
     /// Complete requester Jetty descriptor, needed by bonding CTP to send
     /// the response back through `urma_import_jetty_ex`.
@@ -58,6 +60,7 @@ pub struct CatalogRequest {
 /// Catalog query response body.
 #[derive(Serialize, Deserialize)]
 pub struct CatalogResponse {
+    pub request_id: u64,
     pub descriptor: Option<P2pArtifactDescriptor>,
 }
 
@@ -229,8 +232,24 @@ pub trait RemoteCatalog: Send + Sync {
 pub struct UrmaCatalog {
     context: Arc<UrmaContext>,
     connections: Arc<PeerConnectionManager>,
-    pool: tokio::sync::Mutex<Vec<ControlBuffer>>,
+    pool: Arc<tokio::sync::Mutex<Vec<ControlBuffer>>>,
+    pending: PendingCatalogRequests,
+    next_request_id: AtomicU64,
     timeout: Duration,
+}
+
+type PendingCatalogRequests =
+    Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Option<P2pArtifactDescriptor>>>>>;
+
+struct PendingCatalogRequest {
+    request_id: u64,
+    pending: PendingCatalogRequests,
+}
+
+impl Drop for PendingCatalogRequest {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.request_id);
+    }
 }
 
 impl UrmaCatalog {
@@ -245,7 +264,9 @@ impl UrmaCatalog {
         Ok(Self {
             context,
             connections,
-            pool: tokio::sync::Mutex::new(pool),
+            pool: Arc::new(tokio::sync::Mutex::new(pool)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_request_id: AtomicU64::new(1),
             timeout,
         })
     }
@@ -258,9 +279,39 @@ impl UrmaCatalog {
         }
     }
 
-    async fn release(&self, mut buffers: Vec<ControlBuffer>) {
-        self.pool.lock().await.append(&mut buffers);
+    async fn release(&self, buffer: ControlBuffer) {
+        self.pool.lock().await.push(buffer);
     }
+}
+
+fn dispatch_catalog_response(pending: &PendingCatalogRequests, response: CatalogResponse) -> bool {
+    let sender = pending.lock().unwrap().remove(&response.request_id);
+    sender.is_some_and(|sender| sender.send(response.descriptor).is_ok())
+}
+
+async fn receive_catalog_response(
+    recv_rx: tokio::sync::oneshot::Receiver<Completion>,
+    recv_buf: ControlBuffer,
+    pool: Arc<tokio::sync::Mutex<Vec<ControlBuffer>>>,
+    pending: PendingCatalogRequests,
+    timeout: Duration,
+) {
+    let completion = tokio::time::timeout(timeout, recv_rx).await;
+    match completion {
+        Ok(Ok(cqe)) if cqe.status == 0 => match recv_buf.read_json(cqe.len as usize) {
+            Some(response) => {
+                let request_id = response.request_id;
+                if !dispatch_catalog_response(&pending, response) {
+                    debug!(request_id, "urma: catalog response has no waiting request");
+                }
+            }
+            None => warn!(bytes = cqe.len, "urma: malformed catalog response"),
+        },
+        Ok(Ok(cqe)) => warn!(status = cqe.status, "urma: catalog recv failed"),
+        Ok(Err(_)) => debug!("urma: catalog recv completion channel closed"),
+        Err(_) => warn!(?timeout, "urma: catalog recv timed out"),
+    }
+    pool.lock().await.push(recv_buf);
 }
 
 #[async_trait]
@@ -294,12 +345,21 @@ impl RemoteCatalog for UrmaCatalog {
         connect_timer.finish();
         let buffers_timer = StageTimer::start(key, "catalog_lease_buffers");
         let mut send_buf = self.lease().await?;
-        let mut recv_buf = self.lease().await?;
+        let recv_buf = self.lease().await?;
         buffers_timer.finish();
+
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.pending.lock().unwrap().insert(request_id, response_tx);
+        let pending_request = PendingCatalogRequest {
+            request_id,
+            pending: Arc::clone(&self.pending),
+        };
 
         let result = async {
             let post_timer = StageTimer::start(key, "catalog_encode_post");
             let send_len = send_buf.write_json(&CatalogRequest {
+                request_id,
                 key: key.clone(),
                 requester: jetty_descriptor_address(&conn.local_descriptor),
             })?;
@@ -321,6 +381,17 @@ impl RemoteCatalog for UrmaCatalog {
                     },
                 )
                 .map_err(|e| Error::internal_message("urma post_recv", e))?;
+
+            // Responses to concurrent requests may land in any posted RECV.
+            // A detached receiver dispatches each response by request_id, so
+            // the query does not assume that its own buffer receives its reply.
+            tokio::spawn(receive_catalog_response(
+                recv_rx,
+                recv_buf,
+                Arc::clone(&self.pool),
+                Arc::clone(&self.pending),
+                self.timeout,
+            ));
 
             let send_wr_id = self.context.alloc_wr_id();
             let send_rx = self.context.subscribe(send_wr_id);
@@ -362,36 +433,25 @@ impl RemoteCatalog for UrmaCatalog {
 
             send_timer.finish();
             let recv_timer = StageTimer::start(key, "catalog_response_wait");
-            let recv_cqe = tokio::time::timeout(self.timeout, recv_rx)
+            let descriptor = tokio::time::timeout(self.timeout, response_rx)
                 .await
                 .map_err(|_| {
                     Error::Internal(anyhow::anyhow!(
-                        "urma: catalog response timed out after {:?}",
+                        "urma: catalog response {request_id} timed out after {:?}",
                         self.timeout
                     ))
                 })?
                 .map_err(|_| {
                     Error::Internal(anyhow::anyhow!(
-                        "urma: catalog recv completion channel closed"
+                        "urma: catalog response dispatch channel closed"
                     ))
                 })?;
-            if recv_cqe.status != 0 {
-                return Err(Error::Internal(anyhow::anyhow!(
-                    "urma: catalog recv completed with status {}",
-                    recv_cqe.status
-                )));
-            }
-
             recv_timer.finish();
-            let response = recv_buf.read_json(recv_cqe.len as usize).ok_or_else(|| {
-                Error::Internal(anyhow::anyhow!(
-                    "urma: malformed catalog response ({} bytes)",
-                    recv_cqe.len
-                ))
-            })?;
-            Ok(response.descriptor)
+            Ok(descriptor)
         }
         .await;
+
+        drop(pending_request);
 
         if result.is_err() {
             self.connections.invalidate(&conn.remote_eid);
@@ -399,8 +459,7 @@ impl RemoteCatalog for UrmaCatalog {
             conn.touch();
         }
 
-        let buffers = vec![send_buf, recv_buf];
-        self.release(buffers).await;
+        self.release(send_buf).await;
         if result.is_ok() {
             total_timer.finish();
         }
@@ -661,6 +720,7 @@ async fn handle_request(
     buffer_timer.finish();
     let response_timer = StageTimer::start(&request.key, "catalog_server_resolve_encode_post");
     let response = CatalogResponse {
+        request_id: request.request_id,
         descriptor: resolve(&request.key),
     };
     let send_len = match send_buf.write_json(&response) {
@@ -758,6 +818,7 @@ mod tests {
         let mut buf = ControlBuffer::new(&context).unwrap();
 
         let descriptor = CatalogResponse {
+            request_id: 42,
             descriptor: Some(P2pArtifactDescriptor {
                 key: "k1".to_string(),
                 providers: vec![],
@@ -768,14 +829,53 @@ mod tests {
         let len = buf.write_json(&descriptor).unwrap();
         assert!(len <= CATALOG_BUF_SIZE);
         let parsed = buf.read_json(len).unwrap();
+        assert_eq!(parsed.request_id, 42);
         assert_eq!(parsed.descriptor.as_ref().unwrap().key, "k1");
 
         // Miss case: descriptor is null.
         let len = buf
-            .write_json(&CatalogResponse { descriptor: None })
+            .write_json(&CatalogResponse {
+                request_id: 43,
+                descriptor: None,
+            })
             .unwrap();
         let parsed = buf.read_json(len).unwrap();
+        assert_eq!(parsed.request_id, 43);
         assert!(parsed.descriptor.is_none());
+    }
+
+    #[tokio::test]
+    async fn catalog_responses_are_dispatched_by_request_id() {
+        let pending = PendingCatalogRequests::default();
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+        pending.lock().unwrap().insert(1, first_tx);
+        pending.lock().unwrap().insert(2, second_tx);
+
+        let descriptor = |key: &str| P2pArtifactDescriptor {
+            key: key.to_string(),
+            providers: vec![],
+            backend_locator: None,
+            metadata: serde_json::Value::Null,
+        };
+        assert!(dispatch_catalog_response(
+            &pending,
+            CatalogResponse {
+                request_id: 2,
+                descriptor: Some(descriptor("second")),
+            },
+        ));
+        assert!(dispatch_catalog_response(
+            &pending,
+            CatalogResponse {
+                request_id: 1,
+                descriptor: Some(descriptor("first")),
+            },
+        ));
+
+        assert_eq!(first_rx.await.unwrap().unwrap().key, "first");
+        assert_eq!(second_rx.await.unwrap().unwrap().key, "second");
+        assert!(pending.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -786,6 +886,7 @@ mod tests {
         let big = "x".repeat(CATALOG_BUF_SIZE * 2);
         assert!(buf
             .write_json(&CatalogRequest {
+                request_id: 1,
                 key: big,
                 requester: "urma2:test".to_string(),
             })
