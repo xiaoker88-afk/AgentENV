@@ -420,7 +420,7 @@ class HttpTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
-    def test_workload_is_written_and_verified_by_checksum(self):
+    def test_workload_is_read_with_cat_without_checksum(self):
         outputs = {
             "/dev/shm/aenv-migration-memory.bin": "a" * 64,
             "/opt/agentenv-test/aenv-migration-disk.bin": "b" * 64,
@@ -428,11 +428,13 @@ class RunnerTests(unittest.TestCase):
 
         def execute(_binary, _gateway, _sandbox, command, **_kwargs):
             path = next(path for path in outputs if path in command)
+            if "dd if=" not in command:
+                self.assertEqual(command, f"cat {path} > /dev/null")
             return {
                 "ok": True,
                 "exit_code": 0,
                 "duration_ms": 20,
-                "stdout": f"{outputs[path]}  {path}\n",
+                "stdout": f"{outputs[path]}  {path}\n" if "dd if=" in command else "",
                 "stderr": "",
             }
 
@@ -443,7 +445,8 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(verified["ok"])
         self.assertEqual(prepared["artifacts"]["memory"]["size_bytes"], 4 * 1024 * 1024)
         self.assertEqual(verified["artifacts"]["disk"]["throughput_mib_s"], 400.0)
-        self.assertTrue(verified["artifacts"]["memory"]["checksum_matches"])
+        self.assertIsNone(verified["artifacts"]["memory"]["checksum_matches"])
+        self.assertEqual(verified["artifacts"]["disk"]["read_operation"], "cat")
 
     def test_default_topology_runs_on_a_and_only_uses_ssh_for_b(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(

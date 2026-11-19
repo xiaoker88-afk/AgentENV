@@ -136,3 +136,7 @@ sandbox 归属时，仅采用节点级统计。
 `p2p.transport = "urma"` 支持提前注册；Iroh、composite 等未实现私有准备的传输保留提交后发布行为。POSIX 发布流程不启用该优化。
 
 新增 `snapshot_p2p_prepare` 表示并行准备阶段（best effort），URMA 的 `prepare_register_segment` 表示实际注册耗时。`snapshot_repository_publish` 与准备阶段重叠，不能相加；`snapshot_p2p_publish` 现在主要表示提交后的剩余发布耗时。观察 `source_snapshot` 总耗时确认优化效果。需要更新 A 端 server，B 端不需要为此改变恢复协议。
+
+### 迁移后的读回计时
+
+迁移后在沙箱内执行 `cat <文件> > /dev/null`，避免哈希计算及文件内容经 API 输出影响读取计时。`workload.read_operation` 为 `cat`，结果中的 `checksum_matches` 为 null，文本报告显示 `not_checked`。成功仅表示读取命令成功，不表示内容一致；文件字节数采用准备阶段记录的预期大小。迁移前的数据生成和 SHA-256 记录保留，以保持原有准备流程；本轮读回不进行摘要比较。

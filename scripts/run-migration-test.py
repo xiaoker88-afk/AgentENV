@@ -599,17 +599,14 @@ def verify_workload(
             aenv_binary,
             gateway,
             sandbox_id,
-            f"sha256sum {shlex.quote(before['path'])}",
+            f"cat {shlex.quote(before['path'])} > /dev/null",
         )
-        actual = extract_sha256(result)
-        matches = actual is not None and actual == before.get("sha256")
         duration_ms = result["duration_ms"]
         artifact = {
             "path": before["path"],
             "size_bytes": before["size_bytes"],
-            "expected_sha256": before.get("sha256"),
-            "actual_sha256": actual,
-            "checksum_matches": matches,
+            "read_operation": "cat",
+            "checksum_matches": None,
             "throughput_mib_s": round(
                 before["size_bytes"] / (1024 * 1024) / (duration_ms / 1000), 3
             )
@@ -618,7 +615,7 @@ def verify_workload(
             **result,
         }
         verified["artifacts"][kind] = artifact
-        if not result["ok"] or not matches:
+        if not result["ok"]:
             verified["ok"] = False
     return verified
 
@@ -1155,7 +1152,7 @@ def summarize_run(
                 lines.append(
                     f"{result['sandbox_id']} {kind} {artifact['size_bytes']} "
                     f"{artifact['duration_ms']} {artifact.get('throughput_mib_s', '-')} "
-                    f"{artifact.get('checksum_matches', False)}"
+                    f"{artifact['checksum_matches'] if artifact.get('checksum_matches') is not None else 'not_checked'}"
                 )
     urma_rows = stage_statistics(timings)
     table("P2P STAGES", urma_rows)
@@ -1320,7 +1317,7 @@ def main() -> int:
             "disk_mib": args.disk_workload_mib,
             "memory_path": WORKLOAD_PATHS["memory"],
             "disk_path": WORKLOAD_PATHS["disk"],
-            "read_operation": "sha256sum",
+            "read_operation": "cat",
         },
         "creations": [],
         "workload_preparation": [],
@@ -1446,7 +1443,7 @@ def main() -> int:
                 f"{len(failed)} of {len(sandbox_ids)} migrations failed; see per-sandbox results"
             )
         if run_info["workload_preparation"]:
-            print("[verify] reading and checksumming migrated bytes", flush=True)
+            print("[verify] reading migrated bytes with cat to /dev/null", flush=True)
             expected = {
                 result["sandbox_id"]: result for result in run_info["workload_preparation"]
             }
@@ -1472,7 +1469,7 @@ def main() -> int:
             failed = [result for result in run_info["post_migration_reads"] if not result["ok"]]
             if failed:
                 raise TestFailure(
-                    f"post-migration byte verification failed in {len(failed)} of "
+                    f"post-migration byte read failed in {len(failed)} of "
                     f"{len(sandbox_ids)} sandboxes"
                 )
         run_info["status"] = "succeeded"
